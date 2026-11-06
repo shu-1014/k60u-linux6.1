@@ -1,0 +1,115 @@
+name: Build K60U Linux 6.1
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+    inputs:
+      build_modules:
+        description: "同时编译内核模块 (make modules，耗时较久)"
+        type: boolean
+        default: false
+      kernel_version:
+        description: "Linux 6.1 小版本 (例如 6.1, 6.1.100)"
+        type: string
+        default: "6.1"
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 240
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential flex bison libssl-dev libelf-dev bc \
+            python3 xz-utils kmod cpio rsync
+
+      - name: Fetch Linux kernel source
+        env:
+          KVER: ${{ github.event.inputs.kernel_version || '6.1' }}
+        run: |
+          set -e
+          KVER="${KVER}"
+          # 主线 tarball；6.1 在 v6.x 目录，6.1.x 稳定版同理
+          URL="https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-${KVER}.tar.xz"
+          echo "downloading $URL"
+          curl -fL --retry 3 -o linux.tar.xz "$URL"
+          tar xf linux.tar.xz
+          SRC="linux-${KVER}"
+          [ -d "$SRC" ] || { echo "source dir $SRC missing"; ls -d linux-*; exit 1; }
+          echo "SRC=$SRC" >> "$GITHUB_ENV"
+          echo "KVER=$KVER" >> "$GITHUB_ENV"
+
+      - name: Install K60U device tree
+        run: |
+          set -e
+          MTK="linux-${KVER}/arch/arm64/boot/dts/mediatek"
+          cp dts/mt6985-corot-k60u.dts "$MTK/"
+          if ! grep -q 'mt6985-corot-k60u' "$MTK/Makefile"; then
+            echo 'dtb-$(CONFIG_ARCH_MEDIATEK) += mt6985-corot-k60u.dtb' >> "$MTK/Makefile"
+          fi
+          tail -3 "$MTK/Makefile"
+
+      - name: Configure
+        run: |
+          set -e
+          cd "linux-${KVER}"
+          cp ../configs/k60u_defconfig .config
+          make ARCH=arm64 olddefconfig
+          echo "--- key options ---"
+          grep -E '^CONFIG_ARCH_MEDIATEK|^CONFIG_ARM64=|^CONFIG_LOCALVERSION' .config || true
+
+      - name: Build Image and device tree
+        run: |
+          set -e
+          cd "linux-${KVER}"
+          make ARCH=arm64 -j"$(nproc)" Image
+          make ARCH=arm64 -j"$(nproc)" mediatek/mt6985-corot-k60u.dtb
+          ls -l arch/arm64/boot/Image
+          ls -l arch/arm64/boot/dts/mediatek/mt6985-corot-k60u.dtb
+          sha256sum arch/arm64/boot/Image
+          echo "image_size=$(stat -c%s arch/arm64/boot/Image)" >> "$GITHUB_ENV"
+
+      - name: Build modules
+        if: ${{ github.event.inputs.build_modules == 'true' }}
+        run: |
+          set -e
+          cd "linux-${KVER}"
+          make ARCH=arm64 -j"$(nproc)" modules
+          make ARCH=arm64 INSTALL_MOD_PATH="$PWD/modout" modules_install
+          # 打包成 tar
+          tar -C "$PWD/modout" -czf "$GITHUB_WORKSPACE/k60u-modules-${KVER}.tar.gz" lib/modules
+
+      - name: Package boot.img
+        run: |
+          set -e
+          mkdir -p out
+          python3 scripts/repack_boot.py \
+            bootimg/boot_header.bin \
+            "linux-${KVER}/arch/arm64/boot/Image" \
+            out/boot-6.1-k60u.img
+          cp "linux-${KVER}/arch/arm64/boot/Image" out/Image
+          cp "linux-${KVER}/System.map" out/System.map
+          cp "linux-${KVER}/arch/arm64/boot/dts/mediatek/mt6985-corot-k60u.dtb" out/
+          cp "linux-${KVER}/.config" out/kernel-6.1-k60u.config
+          ls -l out
+          sha256sum out/*
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: k60u-linux6.1-${{ env.KVER }}
+          path: |
+            out/*
+            k60u-modules-*.tar.gz
+          if-no-files-found: warn
+          retention-days: 30
