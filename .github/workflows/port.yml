@@ -1,0 +1,82 @@
+name: Port MT6985 vendor tree (5.15) toward Linux 6.1
+
+on:
+  workflow_dispatch:
+    inputs:
+      stage:
+        description: "analyze = 只做厂商树分析; baseline = 额外用厂商配置编译 5.15 基线; merge = 6.1 核心 + 厂商驱动"
+        type: choice
+        options: [analyze, baseline, merge]
+        default: analyze
+      vendor_ref:
+        description: "MiCode 分支"
+        type: string
+        default: "corot-t-oss"
+
+env:
+  ARCH: arm64
+  CROSS_COMPILE: aarch64-linux-gnu-
+
+jobs:
+  port:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Free disk space
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost || true
+          sudo apt-get clean
+          df -h /
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential flex bison libssl-dev libelf-dev bc \
+            gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu \
+            python3 xz-utils cpio rsync kmod
+
+      - name: Fetch vendor tree (MiCode ${{ inputs.vendor_ref }})
+        run: |
+          set -e
+          URL="https://codeload.github.com/MiCode/Xiaomi_Kernel_OpenSource/tar.gz/refs/heads/${{ inputs.vendor_ref }}"
+          echo "fetching $URL"
+          curl -fL --retry 3 --retry-delay 5 -o vendor.tar.gz "$URL"
+          ls -lh vendor.tar.gz
+          mkdir -p vendor
+          tar xzf vendor.tar.gz -C vendor --strip-components=1
+          rm -f vendor.tar.gz
+          du -sh vendor
+          df -h /
+
+      - name: Analyze vendor tree
+        run: |
+          bash port/analyze_vendor.sh vendor vendor_report.txt || true
+          wc -l vendor_report.txt
+
+      - name: Baseline build (vendor 5.15 config)
+        if: ${{ inputs.stage == 'baseline' }}
+        run: |
+          set -o pipefail
+          cd vendor
+          ls arch/arm64/configs | head -30
+          CFG=$(ls arch/arm64/configs | grep -iE 'corot|6985' | head -1 || true)
+          echo "candidate config: ${CFG:-<none>}"
+          if [ -n "${CFG:-}" ]; then
+            make ARCH=arm64 "${CFG}" 2>&1 | tail -20
+            make ARCH=arm64 -j"$(nproc)" Image 2>&1 | tail -60
+          else
+            echo "no corot/6985 defconfig found; skipping"
+          fi
+
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vendor-report-${{ inputs.vendor_ref }}
+          path: vendor_report.txt
+          if-no-files-found: warn
+          retention-days: 14
