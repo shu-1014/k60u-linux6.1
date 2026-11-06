@@ -19,6 +19,18 @@ scripts/repack_boot.py                  # boot.img 打包脚本（header + Image
 3. 用内核自带 `fdtoverlay` 按 `__symbols__` / `__fixups__` 合并 → 反编译成 `mt6985-corot-k60u.dts`；
 4. 已在本地产线验证：6.1 源码树内编译通过，产出 533 KB DTB。
 
+## 构建状态
+
+✅ 已在本仓库 Actions 上成功产出（Linux 主机，约 20 分钟）：
+
+| 产物 | 大小 | 校验 |
+|---|---|---|
+| `Image` | 37,415,424 B | `code0=0xfa405a4d`，magic `ARM\x64` |
+| `boot-6.1-k60u.img` | 37,421,056 B | `ANDROID!` header v4，内嵌 kernel 与 `Image` 逐字节一致 |
+| `mt6985-corot-k60u.dtb` | 533,487 B | FDT magic `0xd00dfeed` |
+
+产物在对应 run 的 **Artifacts → `k60u-linux6.1-6.1`** 下载（保留 30 天）。
+
 ## 运行
 
 - **自动**：每次 push 到 `main` 触发；
