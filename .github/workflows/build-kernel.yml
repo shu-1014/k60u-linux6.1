@@ -18,6 +18,10 @@ concurrency:
   group: build-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  ARCH: arm64
+  CROSS_COMPILE: aarch64-linux-gnu-
+
 jobs:
   build:
     runs-on: ubuntu-22.04
@@ -31,7 +35,9 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             build-essential flex bison libssl-dev libelf-dev bc \
+            gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu \
             python3 xz-utils kmod cpio rsync
+          aarch64-linux-gnu-gcc --version | head -1
 
       - name: Fetch Linux kernel source
         env:
