@@ -60,10 +60,13 @@ jobs:
           set -e
           MTK="linux-${KVER}/arch/arm64/boot/dts/mediatek"
           cp dts/mt6985-corot-k60u.dts "$MTK/"
-          if ! grep -q 'mt6985-corot-k60u' "$MTK/Makefile"; then
-            echo 'dtb-$(CONFIG_ARCH_MEDIATEK) += mt6985-corot-k60u.dtb' >> "$MTK/Makefile"
-          fi
-          tail -3 "$MTK/Makefile"
+          cp dts/mt6985-corot-k60u-bringup.dts "$MTK/"
+          for d in mt6985-corot-k60u.dtb mt6985-corot-k60u-bringup.dtb; do
+            if ! grep -q "$d" "$MTK/Makefile"; then
+              echo "dtb-\$(CONFIG_ARCH_MEDIATEK) += $d" >> "$MTK/Makefile"
+            fi
+          done
+          tail -5 "$MTK/Makefile"
 
       - name: Configure
         run: |
@@ -71,8 +74,17 @@ jobs:
           cd "linux-${KVER}"
           cp ../configs/k60u_defconfig .config
           make ARCH=arm64 olddefconfig
+          # ---- 关键补丁：崩溃日志(pstore/ramoops) + MTK PMIC(SPMI) ----
+          scripts/config --enable PSTORE
+          scripts/config --enable PSTORE_RAM
+          scripts/config --enable PSTORE_CONSOLE
+          scripts/config --enable PSTORE_DEFAULT_KMSG_BYTES  --set-val PSTORE_DEFAULT_KMSG_BYTES 262144
+          scripts/config --enable SPMI
+          scripts/config --enable SPMI_MTK_PMIF
+          scripts/config --enable COMMON_CLK_MTK
+          make ARCH=arm64 olddefconfig
           echo "--- key options ---"
-          grep -E '^CONFIG_ARCH_MEDIATEK|^CONFIG_ARM64=|^CONFIG_LOCALVERSION' .config || true
+          grep -E '^CONFIG_ARCH_MEDIATEK|^CONFIG_ARM64=|^CONFIG_LOCALVERSION|^CONFIG_PSTORE_RAM|^CONFIG_PSTORE_CONSOLE|^CONFIG_SPMI_MTK_PMIF' .config || true
 
       - name: Build Image and device tree
         run: |
@@ -80,8 +92,10 @@ jobs:
           cd "linux-${KVER}"
           make ARCH=arm64 -j"$(nproc)" Image
           make ARCH=arm64 -j"$(nproc)" mediatek/mt6985-corot-k60u.dtb
+          make ARCH=arm64 -j"$(nproc)" mediatek/mt6985-corot-k60u-bringup.dtb
           ls -l arch/arm64/boot/Image
           ls -l arch/arm64/boot/dts/mediatek/mt6985-corot-k60u.dtb
+          ls -l arch/arm64/boot/dts/mediatek/mt6985-corot-k60u-bringup.dtb
           sha256sum arch/arm64/boot/Image
           echo "image_size=$(stat -c%s arch/arm64/boot/Image)" >> "$GITHUB_ENV"
 
@@ -106,6 +120,7 @@ jobs:
           cp "linux-${KVER}/arch/arm64/boot/Image" out/Image
           cp "linux-${KVER}/System.map" out/System.map
           cp "linux-${KVER}/arch/arm64/boot/dts/mediatek/mt6985-corot-k60u.dtb" out/
+          cp "linux-${KVER}/arch/arm64/boot/dts/mediatek/mt6985-corot-k60u-bringup.dtb" out/
           cp "linux-${KVER}/.config" out/kernel-6.1-k60u.config
           ls -l out
           sha256sum out/*

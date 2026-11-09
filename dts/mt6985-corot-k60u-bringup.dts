@@ -1,27 +1,20 @@
 // SPDX-License-Identifier: (GPL-2.0+ OR MIT)
 /*
- * Redmi K60 Ultra (MT6985 / corot) — Linux 6.1 bring-up device tree
+ * Redmi K60 Ultra (MT6985 / corot) — Linux 6.1 bring-up device tree  (rev2)
  *
- * 目的：只保留主线 6.1 能驱动的节点，用于验证「6.1 内核能在这台机器上引导」。
- * 数据来源：从真机 vendor_boot.img + dtbo.img 还原并合并的完整设备树
- *           （project/dt/mt6985-corot-k60u.dts），此处属性值为实测原值。
- *
- * 与完整设备树的差别（这是必然的，不是遗漏）：
- *   - clock/power-domain/interconnect 依赖全部剥离：6.1 主线没有 mt6985 的
- *     clk / power-controller / dvfsrc 驱动，保留 phandle 会让设备永远 defer。
- *     -> 启动参数里用 clk_ignore_unused/pd_ignore_unused，保持 bootloader 已开的时钟。
- *   - UART 用标准 ns16550a（reg-shift=2, io-width=4）而非 mediatek,mt6577-uart，
- *     这样完全绕开 MTK 时钟框架，最稳。
- *   - 显示/触摸/充电/相机/音频/基带节点全部没有：主线 6.1 无对应驱动。
- *
- * 用法：内核命令行由 bootloader 覆盖时以 bootloader 为准，本文件里的 chosen
- *      仅供 UART/earlycon 调试参考。
+ * rev2 关键修改:
+ *   1. 去掉 init=/bin/sh —— 无 ramdisk 内 shell 时会触发
+ *      "Kernel panic - not syncing: No working init found" 自我重启死循环
+ *   2. 新增 reserved-memory / ramoops —— 内核崩溃日志落内存，熬过重启，
+ *      回原系统后可从 /sys/fs/pstore 读（需 CONFIG_PSTORE_RAM=y）
+ *   3. 不再强制指定 init，交给 ramdisk 自动探测
+ *   4. panic=0 —— panic 后不自动重启，便于观察（真机无串口时靠 ramoops）
  */
 
 /dts-v1/;
 
 / {
-	model = "MT6985 K60U bringup";
+	model = "MT6985 K60U bringup rev2";
 	compatible = "mediatek,mt6985", "xiaomi,corot";
 	interrupt-parent = <&gic>;
 	#address-cells = <0x02>;
@@ -32,16 +25,30 @@
 	};
 
 	chosen {
-		/* 921600n1 = MTK 默认串口参数；earlycon 用 mmio32 直接摸寄存器 */
-		bootargs = "console=ttyS0,921600n1 earlycon=uart8250,mmio32,0x11001000,921600n1 loglevel=8 ignore_loglevel clk_ignore_unused pd_ignore_unused init=/bin/sh";
+		bootargs = "console=ttyS0,921600n1 earlycon=uart8250,mmio32,0x11001000,921600n1 loglevel=8 ignore_loglevel clk_ignore_unused pd_ignore_unused panic=0";
 		stdout-path = "serial0:921600n";
 	};
 
 	/*
-	 * 内存：真机 DTB 里是 1 GB @ 0x40000000，实际物理内存由 LK 在启动时
-	 * 按 SKU 修正（GKI 常规做法）。若引导后 `free` 显示只有 1 GB，
-	 * 说明 LK 没有 fixup 我们自建的 DTB，需要手工填入真实 DRAM 大小。
+	 * 崩溃日志区：1 MB @ 0x4F000000（首个 1GB bank 尾部，由 reserved-memory 排除）
+	 * 布局: console 256K | pmsg 128K | record 256K
 	 */
+	reserved-memory {
+		#address-cells = <0x02>;
+		#size-cells = <0x02>;
+		ranges;
+
+		ramoops@4f000000 {
+			compatible = "ramoops";
+			reg = <0x00 0x4f000000 0x00 0x100000>;
+			record-size = <0x40000>;
+			console-size = <0x40000>;
+			pmsg-size = <0x20000>;
+			ftrace-size = <0x00>;
+			ecc-size = <0x00>;
+		};
+	};
+
 	memory@40000000 {
 		device_type = "memory";
 		reg = <0x00 0x40000000 0x00 0x40000000>;
@@ -67,14 +74,13 @@
 	timer {
 		compatible = "arm,armv8-timer";
 		interrupt-parent = <&gic>;
-		interrupts = <0x01 0x0d 0x04 0x00>,	/* PPI 13 secure phys */
-			     <0x01 0x0e 0x04 0x00>,	/* PPI 14 non-secure phys */
-			     <0x01 0x0b 0x04 0x00>,	/* PPI 11 virtual */
-			     <0x01 0x0a 0x04 0x00>;	/* PPI 10 hyp */
-		clock-frequency = <0xc65d40>;		/* 13 MHz */
+		interrupts = <0x01 0x0d 0x04 0x00>,
+			     <0x01 0x0e 0x04 0x00>,
+			     <0x01 0x0b 0x04 0x00>,
+			     <0x01 0x0a 0x04 0x00>;
+		clock-frequency = <0xc65d40>;
 	};
 
-	/* 4x Cortex-A510 + 3x Cortex-A715 + 1x Cortex-X3（MPIDR 取自真机 DTS） */
 	cpus {
 		#address-cells = <0x01>;
 		#size-cells = <0x00>;
@@ -129,12 +135,6 @@
 		};
 	};
 
-	/*
-	 * 调试串口：真机 DTS 里 compatible 已是 mediatek,mt6577-uart，
-	 * 但那条路径要求 MT6985 时钟驱动（6.1 没有）。这里改用标准
-	 * ns16550a + MMIO 参数，走 8250_of，完全不需要 MTK clk。
-	 * 寄存器布局为 32-bit、stride 4（reg-shift=2）。
-	 */
 	soc {
 		compatible = "simple-bus";
 		#address-cells = <0x02>;
@@ -144,8 +144,8 @@
 		serial@11001000 {
 			compatible = "ns16550a";
 			reg = <0x00 0x11001000 0x00 0x1000>;
-			interrupts = <0x00 0xfa 0x04 0x00>;	/* GIC_SPI 250 */
-			clock-frequency = <0x18cba80>;		/* 26 MHz */
+			interrupts = <0x00 0xfa 0x04 0x00>;
+			clock-frequency = <0x18cba80>;
 			reg-shift = <0x02>;
 			reg-io-width = <0x04>;
 			status = "okay";
