@@ -4,7 +4,7 @@ This candidate must remain independent from the boot image workflow. It is not a
 
 ## Isolation
 
-Use a new experimental compatible, never alias mt8195 and never claim all mt6985-scpsys domains. Require an explicit enable gate defaulting false. Expose IDs 2/3 only; other onecell slots must be NULL so the standard xlate returns ENOENT. Do not place ERR_PTR values in the array: Linux 6.1 registration iterates every non-NULL entry as a real genpd. No shipping DTS may silently select this driver. Explicit SPM MMIO and infra/VLP/UFS-AO syscon phandles are required. No guessed parent clocks, supply voltages or subdomain relationships.
+Use a new experimental compatible, never alias mt8195 and never claim all mt6985-scpsys domains. Runtime activation is prohibited: probe must always refuse before MMIO mapping or genpd registration, with no boot parameter bypass. Expose IDs 2/3 only; other onecell slots must be NULL so the standard xlate returns ENOENT. Do not place ERR_PTR values in the array: Linux 6.1 registration iterates every non-NULL entry as a real genpd. No shipping DTS may silently select this driver. Explicit SPM MMIO and infra/VLP/UFS-AO syscon phandles are required. No guessed parent clocks, supply voltages or subdomain relationships.
 
 ## Source-backed sequence
 
@@ -21,6 +21,12 @@ Host bus steps: VLP set214/clr218/en210/sta220 bit7; infra sete4/clre8/ene0/stae
 Reject mixed ACK states. Do not label unknown hardware state active using only software flags. Initial state needs control, ACK, SRAM and bus-enable consistency checks. Firmware/bootloader already-on is not automatically proven safe to take over. Conservative rejection of bootloader-off PHY is acceptable because retention history is unavailable.
 
 Transition failure is not proof of successful rollback. Best-effort unwind of newly asserted protection must preserve pre-existing bits. Mark uncertain domains faulted, prevent subsequent destructive callbacks, and log the failing phase. Never report success after partial control or failed bus write. Serialize domains if they share controller resources. Cleanup must not free state while genpd consumers can still reference it.
+
+## Review finding: permanent fault flag is not consumer isolation
+
+Linux 6.1 genpd retains logical ON if power_off fails, then power_on may take an ON fast path without invoking this driver's callback. Runtime suspend can hide the domain-off error from the consumer. Thus a fault flag cannot prevent consumer access to partially powered hardware. Empty domains may also be automatically powered off by genpd late-init work. The candidate has no runtime activation entry until safe recovery or complete consumer isolation is designed. Returning an error or fabricating genpd status is not a fix.
+
+Candidate checks only initial readback consistency, not bootloader ownership or retention contents. Probe must remain compile-only. Successful static-DT registration lifetime assumptions are also not acceptable for a future removable provider.
 
 ## What compilation cannot validate
 
