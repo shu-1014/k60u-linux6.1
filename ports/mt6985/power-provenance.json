@@ -1,0 +1,14 @@
+{
+  "repository": "https://github.com/MiCode/Xiaomi_Kernel_OpenSource",
+  "commit": "cb2ab59a621b17aafa4a3f349c84d9f18adf7aaf",
+  "branch": "corot-t-oss",
+  "reference_files": [
+    {"path": "drivers/soc/mediatek/mtk-scpsys.c", "sha256": "30b4143b17c1c96938feaf2e9d24041b05a63d9bd9a9bb2fac70a4c4d199933d"},
+    {"path": "drivers/soc/mediatek/mtk-scpsys-mt6985.c", "sha256": "4c3e5cd6ebaf66c9e7ab0585f7553c7fa4e0c169db5db12ef1a5c0b75887758d"},
+    {"path": "drivers/soc/mediatek/scpsys.h", "sha256": "c3a3e608f9f77c30547899ad6b06b0618d4ff4dc56ade8c19733e683093c9833"}
+  ],
+  "candidate": "linux-6.1/drivers/soc/mediatek/mt6985-ufs-power-experimental.c",
+  "scope": "UFS domain 2/3 sequence candidate only; probe always rejects; no Kconfig/Makefile/DTS integration; no consumer-isolation guarantee or hardware validation",
+  "tests": "Actual extracted C helpers in modeled MMIO/regmap; no genpd core execution",
+  "boot_verified": false
+}

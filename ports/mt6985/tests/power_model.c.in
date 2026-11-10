@@ -58,6 +58,7 @@ static struct ufs_power power;
 static struct device device;
 static u32 freeze_ack; /* ACK bits held at their previous level. */
 static bool hold_clear_status, suppress_set_ack;
+static bool suppress_clear_enable, failed_write_no_effect;
 static unsigned int fail_write_at, fail_read_at, fail_write_again_at;
 static unsigned int suppress_enable_writes;
 
@@ -107,16 +108,18 @@ static int regmap_write(struct regmap *map, unsigned int reg, unsigned int value
     const struct ufs_protection *p = lookup(map, reg, &set);
     log_event(BUS, map->id, reg, map->regs[p->enable / 4], value);
     bus_writes++;
-    /* Even a failed write may have a partial device effect: apply first. */
+    bool failed = bus_writes == fail_write_at || bus_writes == fail_write_again_at;
+    /* Default: apply before reporting error; optionally fail without effect. */
+    if (failed && failed_write_no_effect) return -EIO;
     if (set) {
         if (suppress_enable_writes) suppress_enable_writes--;
         else map->regs[p->enable / 4] |= value;
         if (!suppress_set_ack) map->regs[p->status / 4] |= value;
     } else {
-        map->regs[p->enable / 4] &= ~value;
+        if (!suppress_clear_enable) map->regs[p->enable / 4] &= ~value;
         if (!hold_clear_status) map->regs[p->status / 4] &= ~value;
     }
-    return (bus_writes == fail_write_at || bus_writes == fail_write_again_at) ? -EIO : 0;
+    return failed ? -EIO : 0;
 }
 static int regmap_read(struct regmap *map, unsigned int reg, unsigned int *value)
 {
@@ -136,6 +139,7 @@ static void reset(void)
     freeze_ack = 0;
     fail_write_at = fail_read_at = fail_write_again_at = suppress_enable_writes = 0;
     hold_clear_status = suppress_set_ack = false;
+    suppress_clear_enable = failed_write_no_effect = false;
     power.dev = &device;
     power.base = spm;
     power.ready = true;
@@ -313,6 +317,24 @@ static void test_bus_rollback(void)
     reset(); fail_write_at = 3; fail_write_again_at = 4;
     CHECK(transition(0, false) == -EIO && errors == 2);
     CHECK(bus_writes == 6); /* Rollback continues after its own error. */
+    reset(); fail_write_at = 3; fail_write_again_at = 5;
+    failed_write_no_effect = true;
+    CHECK(transition(0, false) == -EIO && power.faulted && errors == 2);
+    cursor = 0;
+    for (unsigned int i = 0; i < 3; i++) expect_bus(&ufs_host_protection[i], true);
+    for (int i = 2; i >= 0; i--) expect_bus(&ufs_host_protection[i], false);
+    CHECK(bus_writes == 6 && write_count() == 6);
+    CHECK(spm[0xe10 / 4] == UFS_STATE_ON); /* No SRAM/power writes. */
+    for (unsigned int i = 0; i < 3; i++) {
+        const struct ufs_protection *p = &ufs_host_protection[i];
+        u32 expected = i == 1 ? p->mask : 0;
+        CHECK((maps[p->type].regs[p->enable / 4] & p->mask) == expected);
+        CHECK((maps[p->type].regs[p->status / 4] & p->mask) == expected);
+    }
+    CHECK(ufs_state(&power.domain[0]) == -EUCLEAN);
+    unsigned int writes = write_count();
+    CHECK(transition(1, false) == -EIO && write_count() == writes);
+    /* A rollback attempt is not a guarantee of restored protection state. */
 }
 static void test_bus_ack_and_read_errors(void)
 {
@@ -333,6 +355,54 @@ static void test_enable_retry(void)
     CHECK(transition(0, false) == -EIO && power.faulted && bus_writes == 12);
     CHECK(spm[0xe10 / 4] == UFS_STATE_ON);
 }
+static void expect_no_clear_status_reads(const struct ufs_domain *d, unsigned int first_clear)
+{
+    CHECK(first_clear < ntrace);
+    for (unsigned int i = first_clear; i < ntrace; i++)
+        for (unsigned int j = 0; j < d->nprotection; j++) {
+            const struct ufs_protection *p = &d->protection[j];
+            CHECK(!(trace[i].type == READ_BUS && trace[i].id == (unsigned int)p->type && trace[i].reg == p->status));
+        }
+}
+static void test_on_clear_failures(void)
+{
+    for (unsigned int index = 0; index < 2; index++) {
+        /* Error writes take effect first; readback suppression fails first clear. */
+        for (unsigned int readback = 0; readback < 2; readback++) {
+            unsigned int stages = readback ? 1 : (index ? 1 : 3);
+            for (unsigned int stage = 1; stage <= stages; stage++) {
+                reset(); CHECK(transition(index, false) == 0);
+                struct ufs_domain *d = &power.domain[index];
+                CHECK(d->rtff_saved == d->phy);
+                clear_trace();
+                if (readback) suppress_clear_enable = true;
+                else fail_write_at = stage;
+                hold_clear_status = true;
+                CHECK(transition(index, true) == -EIO && power.faulted && errors == 1);
+                CHECK(d->rtff_saved == d->phy); /* Failure cannot consume provenance. */
+                CHECK(bus_writes == stage);
+                CHECK(write_count() == ARRAY_SIZE(on_steps) + (d->phy ? ARRAY_SIZE(restore_steps) : 0) + stage);
+                unsigned int first_clear = 0;
+                while (first_clear < ntrace && trace[first_clear].type != BUS) first_clear++;
+                cursor = first_clear;
+                for (unsigned int j = 0; j < stage; j++)
+                    expect_bus(&d->protection[d->nprotection - 1 - j], false);
+                while (cursor < ntrace && trace[cursor].type == READ_BUS) cursor++;
+                CHECK(cursor == ntrace); /* No later clear or power rollback. */
+                expect_no_clear_status_reads(d, first_clear);
+                for (unsigned int j = 0; j < d->nprotection; j++) {
+                    const struct ufs_protection *p = &d->protection[j];
+                    bool cleared = !readback && j >= d->nprotection - stage;
+                    CHECK((maps[p->type].regs[p->enable / 4] & p->mask) == (cleared ? 0 : p->mask));
+                    CHECK((maps[p->type].regs[p->status / 4] & p->mask) == p->mask);
+                }
+                unsigned int writes = write_count();
+                CHECK(transition(1 - index, false) == -EIO && write_count() == writes);
+                /* Only mock effects are asserted, never hardware recovery. */
+            }
+        }
+    }
+}
 static void test_clear_ign(void)
 {
     for (unsigned int i = 0; i < 2; i++) {
@@ -348,9 +418,8 @@ static void test_clear_ign(void)
             const struct ufs_protection *p = &d->protection[j];
             CHECK((maps[p->type].regs[p->enable / 4] & p->mask) == 0);
             CHECK((maps[p->type].regs[p->status / 4] & p->mask) == p->mask);
-            for (unsigned int k = first_clear; k < ntrace; k++)
-                CHECK(!(trace[k].type == READ_BUS && trace[k].id == (unsigned int)p->type && trace[k].reg == p->status));
         }
+        expect_no_clear_status_reads(d, first_clear);
     }
 }
 int main(void)
@@ -364,6 +433,7 @@ int main(void)
     RUN(test_bus_ack_and_read_errors);
     RUN(test_enable_retry);
     RUN(test_clear_ign);
+    RUN(test_on_clear_failures);
     puts("PASS all real-candidate model assertions (no hardware validation)");
     return 0;
 }
