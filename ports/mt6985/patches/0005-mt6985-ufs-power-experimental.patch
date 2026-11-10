@@ -1,6 +1,6 @@
 --- /dev/null
 +++ b/drivers/soc/mediatek/mt6985-ufs-power-experimental.c
-@@ -0,0 +1,472 @@
+@@ -0,0 +1,475 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +/*
 + * MT6985 UFS-only, opt-in Linux 6.1 experiment. NOT a production driver.
@@ -14,9 +14,9 @@
 + *
 + * Integration is intentionally absent: no Kconfig, Makefile or DT changes.
 + * Build into the kernel only, with CONFIG_PM_GENERIC_DOMAINS and OF enabled.
-+ * Manually opt in using mt6985_ufs_power_experimental.enable=1 (the built-in
-+ * object name must be mt6985-ufs-power-experimental.o). The parameter is
-+ * read-only after boot. Default probe refuses before mapping/writing anything.
++ * Compile/review only: probe unconditionally refuses before mapping anything.
++ * There is no runtime opt-in parameter. genpd partial-off failure isolation and
++ * consumer recovery are unresolved, so the sequence must not be activated.
 + * Only compatible "mediatek,mt6985-ufs-power-experimental" is accepted.
 + * Resource 0 must cover the SPM register window through 0xe17. Explicit syscon
 + * phandles: mediatek,infracfg, mediatek,vlpcfg, mediatek,ufscfg-ao.
@@ -134,9 +134,12 @@
 +	struct genpd_onecell_data onecell;
 +};
 +
-+static bool enable;
-+module_param(enable, bool, 0400);
-+MODULE_PARM_DESC(enable, "DANGEROUS: explicitly enable isolated UFS power experiment (default false)");
++/* No boot parameter can bypass this gate. Compilation/review only.
++ * genpd can keep logical ON after a partial power-off failure and can then
++ * resume consumers without calling our power_on callback. faulted alone is
++ * not consumer isolation. Resolve that policy before any runtime experiment.
++ */
++static const bool runtime_review_approved;
 +
 +static void ufs_update(struct ufs_domain *d, u32 mask, u32 bits)
 +{
@@ -378,9 +381,9 @@
 +	int states[2], i, ret, initialized = 0;
 +	u32 cells;
 +
-+	if (!enable)
++	if (!runtime_review_approved)
 +		return dev_err_probe(dev, -EOPNOTSUPP,
-+				     "disabled; requires explicit experimental opt-in\n");
++				     "compile-only: genpd failure isolation unresolved\n");
 +	if (!IS_ENABLED(CONFIG_PM_GENERIC_DOMAINS_OF))
 +		return -EOPNOTSUPP;
 +	ret = of_property_read_u32(dev->of_node, "#power-domain-cells", &cells);
