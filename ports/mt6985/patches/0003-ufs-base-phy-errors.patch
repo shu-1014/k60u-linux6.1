@@ -1,0 +1,34 @@
+--- a/drivers/ufs/host/ufs-mediatek.c
++++ b/drivers/ufs/host/ufs-mediatek.c
+@@ -435,9 +435,18 @@
+ 			usleep_range(200, 210);
+ 			ufs_mtk_va09_pwr_ctrl(res, 1);
+ 		}
+-		phy_power_on(mphy);
++		ret = phy_power_on(mphy);
++		if (ret) {
++			if (ufs_mtk_is_va09_supported(hba)) {
++				ufs_mtk_va09_pwr_ctrl(res, 0);
++				regulator_disable(host->reg_va09);
++			}
++			return ret;
++		}
+ 	} else {
+-		phy_power_off(mphy);
++		ret = phy_power_off(mphy);
++		if (ret)
++			return ret;
+ 		if (ufs_mtk_is_va09_supported(hba)) {
+ 			ufs_mtk_va09_pwr_ctrl(res, 0);
+ 			ret = regulator_disable(host->reg_va09);
+@@ -917,7 +926,9 @@
+ 	 *
+ 	 * Enable phy clocks specifically here.
+ 	 */
+-	ufs_mtk_mphy_power_on(hba, true);
++	err = ufs_mtk_mphy_power_on(hba, true);
++	if (err)
++		goto out_variant_clear;
+ 	ufs_mtk_setup_clocks(hba, true, POST_CHANGE);
+ 
+ 	host->ip_ver = ufshcd_readl(hba, REG_UFS_MTK_IP_VER);

@@ -27,8 +27,13 @@ jobs:
       - name: Install port slice and compile object
         run: |
           set -eux
-          cp -r ports/mt6985/linux-6.1/. linux-6.1/
           cd linux-6.1
+          for p in ../ports/mt6985/patches/*.patch; do
+            patch --batch --fuzz=0 -p1 < "$p"
+          done
+          diff -u ../ports/mt6985/linux-6.1/drivers/clk/mediatek/clk-mt6985-peri.c drivers/clk/mediatek/clk-mt6985-peri.c
+          diff -u ../ports/mt6985/linux-6.1/include/dt-bindings/clock/mt6985-clk.h include/dt-bindings/clock/mt6985-clk.h
+          diff -u ../ports/mt6985/linux-6.1/drivers/ufs/host/ufs-mediatek.c drivers/ufs/host/ufs-mediatek.c
           make defconfig
           scripts/config --enable SCSI_UFSHCD --enable SCSI_UFSHCD_PLATFORM --enable SCSI_UFS_MEDIATEK
           make olddefconfig
