@@ -1,9 +1,118 @@
 --- a/drivers/regulator/mt6363-regulator.c
 +++ b/drivers/regulator/mt6363-regulator.c
-@@ -1083,56 +1083,132 @@
- 	return 0;
+@@ -5,6 +5,8 @@
+ #include <linux/interrupt.h>
+ #include <linux/mfd/mt6363/registers.h>
+ #include <linux/module.h>
++#include <linux/mutex.h>
++#include <linux/slab.h>
+ #include <linux/of_device.h>
+ #include <linux/platform_device.h>
+ #include <linux/regmap.h>
+@@ -52,8 +54,14 @@
+  */
+ struct mt6363_regulator_info {
+ 	int irq;
+-	int oc_irq_enable_delay_ms;
++	u32 oc_irq_enable_delay_ms;
+ 	struct delayed_work oc_work;
++	/* Threaded handler and work may call sleeping irqchip bus callbacks. */
++	struct mutex oc_lock;
++	bool stopping;
++	bool irq_disabled;
++	bool irq_requested;
++	struct regulator_dev *rdev;
+ 	struct regulator_desc desc;
+ 	u32 lp_mode_reg;
+ 	u32 lp_mode_mask;
+@@ -689,7 +697,7 @@
+ 			      struct regulator_config *config);
+ 
+ /* The array is indexed by id(MT6363_ID_XXX) */
+-static struct mt6363_regulator_info mt6363_regulators[] = {
++static const struct mt6363_regulator_info mt6363_regulators[] = {
+ 	MT6363_BUCK(VS2, 0, 1600000, 12500, mt_volt_range0,
+ 		    MT6363_RG_BUCK_VS2_EN_ADDR,
+ 		    MT6363_RG_BUCK_VS2_EN_SHIFT,
+@@ -1004,22 +1012,40 @@
+ 	struct mt6363_regulator_info *info
+ 		= container_of(dwork, struct mt6363_regulator_info, oc_work);
+ 
+-	enable_irq(info->irq);
++	mutex_lock(&info->oc_lock);
++	if (!info->stopping && info->irq_disabled) {
++		enable_irq(info->irq);
++		info->irq_disabled = false;
++	}
++	mutex_unlock(&info->oc_lock);
  }
  
+ static irqreturn_t mt6363_oc_irq(int irq, void *data)
+ {
+-	struct regulator_dev *rdev = (struct regulator_dev *)data;
++	struct regulator_dev *rdev = data;
+ 	struct mt6363_regulator_info *info = rdev_get_drvdata(rdev);
+ 
+-	disable_irq_nosync(info->irq);
+-	if (!regulator_is_enabled_regmap(rdev))
+-		goto delayed_enable;
+-	regulator_notifier_call_chain(rdev, REGULATOR_EVENT_OVER_CURRENT,
+-				      NULL);
+-delayed_enable:
+-	schedule_delayed_work(&info->oc_work,
+-			      msecs_to_jiffies(info->oc_irq_enable_delay_ms));
++	mutex_lock(&info->oc_lock);
++	if (info->stopping) {
++		mutex_unlock(&info->oc_lock);
++		return IRQ_HANDLED;
++	}
++	if (!info->irq_disabled) {
++		disable_irq_nosync(irq);
++		info->irq_disabled = true;
++	}
++	mutex_unlock(&info->oc_lock);
++
++	/* Do not hold oc_lock across a potentially reentrant notifier. */
++	if (regulator_is_enabled_regmap(rdev) > 0)
++		regulator_notifier_call_chain(rdev, REGULATOR_EVENT_OVER_CURRENT,
++					      NULL);
++
++	mutex_lock(&info->oc_lock);
++	if (!info->stopping)
++		schedule_delayed_work(&info->oc_work,
++			msecs_to_jiffies(info->oc_irq_enable_delay_ms));
++	mutex_unlock(&info->oc_lock);
+ 	return IRQ_HANDLED;
+ }
+ 
+@@ -1035,7 +1061,6 @@
+ 					   &info->oc_irq_enable_delay_ms);
+ 		if (ret || !info->oc_irq_enable_delay_ms)
+ 			info->oc_irq_enable_delay_ms = DEFAULT_DELAY_MS;
+-		INIT_DELAYED_WORK(&info->oc_work, mt6363_oc_irq_enable_work);
+ 	}
+ 	return 0;
+ }
+@@ -1046,66 +1071,144 @@
+ 	u32 val = 0;
+ 
+ 	ret = regmap_read(map, info->op_en_reg + OP_CFG_OFFSET, &info->orig_op_cfg);
+-	for (i = 0; i < 3; i++) {
+-		ret |= regmap_read(map, info->op_en_reg + i, &val);
+-		info->orig_op_en |= val << (i * 8);
+-	}
+ 	if (ret)
+ 		return ret;
++	for (i = 0; i < 3; i++) {
++		ret = regmap_read(map, info->op_en_reg + i, &val);
++		if (ret)
++			return ret;
++		info->orig_op_en |= val << (i * 8);
++	}
+ 
+ 	return 0;
++}
++
 +struct mt6363_regulator_data {
 +	struct mt6363_regulator_info *regulators;
 +};
@@ -40,8 +149,8 @@
 +	 * shutdown baseline of 1; the next irq_startup() resets it to 0.
 +	 * Never enable a freed IRQ to "balance" a cancelled OC delay.
 +	 */
-+}
-+
+ }
+ 
  static int mt6363_regulator_probe(struct platform_device *pdev)
  {
  	/* Compile-only vendor candidate; no runtime override is permitted. */
@@ -167,7 +276,7 @@
  	return 0;
  }
  
-@@ -1147,6 +1223,7 @@
+@@ -1120,6 +1223,7 @@
  		.name = "mt6363-regulator",
  	},
  	.probe = mt6363_regulator_probe,
