@@ -30,7 +30,9 @@ jobs:
           cp -r ports/mt6985/linux-6.1/. linux-6.1/
           cd linux-6.1
           make defconfig
-          make -j"$(nproc)" drivers/clk/mediatek/clk-mt6985-peri.o
+          scripts/config --enable SCSI_UFSHCD --enable SCSI_UFSHCD_PLATFORM --enable SCSI_UFS_MEDIATEK
+          make olddefconfig
+          make -j"$(nproc)" drivers/clk/mediatek/clk-mt6985-peri.o drivers/ufs/host/ufs-mediatek.o
           aarch64-linux-gnu-readelf -h drivers/clk/mediatek/clk-mt6985-peri.o
           aarch64-linux-gnu-nm drivers/clk/mediatek/clk-mt6985-peri.o | grep -E 'ufsao_clks|ufspdn_clks|of_match_clk_mt6985_peri'
       - name: Upload object and provenance
@@ -39,5 +41,6 @@ jobs:
           name: mt6985-peripheral-gates-compile-only
           path: |
             linux-6.1/drivers/clk/mediatek/clk-mt6985-peri.o
+            linux-6.1/drivers/ufs/host/ufs-mediatek.o
             ports/mt6985/provenance.json
           if-no-files-found: error
