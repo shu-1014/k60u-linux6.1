@@ -10,7 +10,7 @@ No PHY firmware power path is enabled until ordering and ownership are implement
 
 ## Preparatory host error propagation
 
-The host slice currently adds checks for failed phy_power_on/off, avoids marking the base PHY hold as powered on when the PHY operation fails, rolls back VA09 enable on PHY-on failure, restores clock/refclk intent on clock-hold power-off failure, and propagates errors from setup_clocks/initialization.
+The host slice is restricted to base-hold phy_power_on/off checks and the initial base-hold error in variant initialization. It avoids setting mphy_powered_on on PHY failure and attempts VA09 rollback on initial power-on failure. The clock-hold/setup_clocks path is deliberately unchanged: core asynchronous gate_work ignores callback errors, so changing only the variant would create a partially handled failure policy. The initial wider candidate compiled but was narrowed after review.
 
 This is necessary groundwork, not a complete transactional PM implementation. Regulator-disable rollback failure, firmware SMC return semantics, unbind/error-path cleanup and core callers' handling of callback errors must still be reviewed. The slice remains separate from the boot-image workflow.
 

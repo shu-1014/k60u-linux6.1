@@ -650,15 +650,12 @@ static void ufs_mtk_scale_perf(struct ufs_hba *hba, bool scale_up)
 	ufs_mtk_boost_pm_qos(hba, scale_up);
 }
 
-static int ufs_mtk_pwr_ctrl(struct ufs_hba *hba, bool on)
+static void ufs_mtk_pwr_ctrl(struct ufs_hba *hba, bool on)
 {
 	struct ufs_mtk_host *host = ufshcd_get_variant(hba);
-	int ret;
 
 	if (on) {
-		ret = phy_power_on(host->mphy);
-		if (ret)
-			return ret;
+		phy_power_on(host->mphy);
 		ufs_mtk_setup_ref_clk(hba, on);
 		if (!ufshcd_is_clkscaling_supported(hba))
 			ufs_mtk_scale_perf(hba, on);
@@ -666,15 +663,8 @@ static int ufs_mtk_pwr_ctrl(struct ufs_hba *hba, bool on)
 		if (!ufshcd_is_clkscaling_supported(hba))
 			ufs_mtk_scale_perf(hba, on);
 		ufs_mtk_setup_ref_clk(hba, on);
-		ret = phy_power_off(host->mphy);
-		if (ret) {
-			ufs_mtk_setup_ref_clk(hba, true);
-			if (!ufshcd_is_clkscaling_supported(hba))
-				ufs_mtk_scale_perf(hba, true);
-			return ret;
-		}
+		phy_power_off(host->mphy);
 	}
-	return 0;
 }
 
 /**
@@ -719,9 +709,9 @@ static int ufs_mtk_setup_clocks(struct ufs_hba *hba, bool on,
 		}
 
 		if (clk_pwr_off)
-			ret = ufs_mtk_pwr_ctrl(hba, false);
+			ufs_mtk_pwr_ctrl(hba, false);
 	} else if (on && status == POST_CHANGE) {
-		ret = ufs_mtk_pwr_ctrl(hba, true);
+		ufs_mtk_pwr_ctrl(hba, true);
 	}
 
 	return ret;
@@ -939,11 +929,7 @@ static int ufs_mtk_init(struct ufs_hba *hba)
 	err = ufs_mtk_mphy_power_on(hba, true);
 	if (err)
 		goto out_variant_clear;
-	err = ufs_mtk_setup_clocks(hba, true, POST_CHANGE);
-	if (err) {
-		ufs_mtk_mphy_power_on(hba, false);
-		goto out_variant_clear;
-	}
+	ufs_mtk_setup_clocks(hba, true, POST_CHANGE);
 
 	host->ip_ver = ufshcd_readl(hba, REG_UFS_MTK_IP_VER);
 
