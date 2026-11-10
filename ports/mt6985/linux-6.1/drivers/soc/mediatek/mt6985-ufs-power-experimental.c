@@ -1,0 +1,472 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/*
+ * MT6985 UFS-only, opt-in Linux 6.1 experiment. NOT a production driver.
+ *
+ * Register/sequence provenance (corot-t-oss vendor reference):
+ * drivers/soc/mediatek/mtk-scpsys-mt6985.c: UFS0_SHUTDOWN and
+ * UFS0_PHY_SHUTDOWN entries; mtk-scpsys.c: scpsys_power_{on,off},
+ * scpsys_sram_{enable,disable}, set_bus_protection; scpsys.h: BUS_PROT_IGN.
+ * Domain IDs/37 slots follow include/dt-bindings/power/mt6985-power.h.
+ * No upstream MT6985 bindings/header or global power-status bits are assumed.
+ *
+ * Integration is intentionally absent: no Kconfig, Makefile or DT changes.
+ * Build into the kernel only, with CONFIG_PM_GENERIC_DOMAINS and OF enabled.
+ * Manually opt in using mt6985_ufs_power_experimental.enable=1 (the built-in
+ * object name must be mt6985-ufs-power-experimental.o). The parameter is
+ * read-only after boot. Default probe refuses before mapping/writing anything.
+ * Only compatible "mediatek,mt6985-ufs-power-experimental" is accepted.
+ * Resource 0 must cover the SPM register window through 0xe17. Explicit syscon
+ * phandles: mediatek,infracfg, mediatek,vlpcfg, mediatek,ufscfg-ao.
+ * #power-domain-cells must be 1; only IDs 2 and 3 are implemented.
+ *
+ * No remove/unload: this is a built-in, static-DT-only isolated experiment.
+ * Unbind attributes are suppressed; hot-removal/DT overlay removal is NOT
+ * supported. Do not instantiate on removable platform devices or alongside
+ * any firmware/driver which can change these registers. An operator must first
+ * establish exclusive ownership and external UFS quiescence; neither can be
+ * proven by this file. The vendor entries have no supply or clock descriptors,
+ * so none are invented here. No UFS host/PHY, clocks, reset provider or other
+ * SPM domain is implemented, and no domain dependency is invented.
+ *
+ * Initial mixed/partial states are rejected without writes. PHY initial OFF
+ * is rejected: vendor software's rtff_flag cannot be reconstructed from ACKs.
+ * PHY may start ON and subsequently restore only a save performed here.
+ * Any transition/precondition failure faults the ENTIRE controller permanently.
+ * Bus-only rollback is attempted before SRAM/power changes, including the
+ * failed write's potentially partial effect; failures are reported separately.
+ * There is deliberately no guessed MTCMOS/SRAM rollback after partial power
+ * transitions. genpd receives the original error, never fabricated success.
+ *
+ * Clear protection ACK is deliberately ignored, as in vendor BUS_PROT_IGN:
+ * other voters can hold ACK. We additionally require enable-bit readback to
+ * confirm clear writes; this is a conservative admission check, not hardware
+ * validation. Initial ON likewise checks enable, not clear status ACK.
+ */
+#include <linux/bitops.h>
+#include <linux/delay.h>
+#include <linux/err.h>
+#include <linux/init.h>
+#include <linux/io.h>
+#include <linux/iopoll.h>
+#include <linux/mfd/syscon.h>
+#include <linux/module.h>
+#include <linux/mutex.h>
+#include <linux/of.h>
+#include <linux/platform_device.h>
+#include <linux/pm_domain.h>
+#include <linux/regmap.h>
+#include <linux/slab.h>
+#include <linux/time64.h>
+
+#ifdef MODULE
+#error "MT6985 UFS power experiment is built-in only; unloading is unsafe"
+#endif
+
+#define UFS_RST_B		BIT(0)
+#define UFS_ISO			BIT(1)
+#define UFS_ON			BIT(2)
+#define UFS_ON_2ND		BIT(3)
+#define UFS_CLK_DIS		BIT(4)
+#define UFS_SRAM_CLKISO		BIT(5)
+#define UFS_SRAM_ISOINT_B	BIT(6)
+#define UFS_SRAM_PDN		BIT(8)
+#define UFS_SRAM_ACK		BIT(12)
+#define UFS_RTFF_SAVE		BIT(24)
+#define UFS_RTFF_NRESTORE	BIT(25)
+#define UFS_RTFF_CLK_DIS		BIT(28)
+#define UFS_ACK			BIT(30)
+#define UFS_ACK_2ND		BIT(31)
+#define UFS_ACK_MASK		(UFS_ACK | UFS_ACK_2ND)
+#define UFS_STATE_MASK		(UFS_RST_B | UFS_ISO | UFS_ON | UFS_ON_2ND | \
+				 UFS_CLK_DIS | UFS_SRAM_CLKISO | \
+				 UFS_SRAM_ISOINT_B | UFS_SRAM_PDN | \
+				 UFS_SRAM_ACK | UFS_ACK_MASK)
+#define UFS_STATE_ON		(UFS_RST_B | UFS_ON | UFS_ON_2ND | \
+				 UFS_SRAM_ISOINT_B | UFS_ACK_MASK)
+#define UFS_STATE_OFF		(UFS_ISO | UFS_CLK_DIS | UFS_SRAM_CLKISO | \
+				 UFS_SRAM_PDN | UFS_SRAM_ACK)
+#define UFS_POLL_US		10
+#define UFS_TIMEOUT_US		USEC_PER_SEC
+#define UFS_PD_COUNT		37
+#define UFS_PD_FIRST		2
+#define UFS_PD_LAST		3
+
+enum ufs_bus_type { UFS_BUS_IFR, UFS_BUS_VLP, UFS_BUS_AO, UFS_BUS_COUNT };
+
+struct ufs_protection {
+	enum ufs_bus_type type;
+	u32 set, clear, enable, status, mask;
+};
+
+static const struct ufs_protection ufs_host_protection[] = {
+	{ UFS_BUS_VLP, 0x214, 0x218, 0x210, 0x220, BIT(7) },
+	{ UFS_BUS_IFR, 0x0e4, 0x0e8, 0x0e0, 0x0ec, BIT(4) },
+	{ UFS_BUS_VLP, 0x214, 0x218, 0x210, 0x220, BIT(8) },
+};
+
+static const struct ufs_protection ufs_phy_protection[] = {
+	{ UFS_BUS_AO, 0x54, 0x58, 0x50, 0x5c, BIT(0) },
+};
+
+struct ufs_power;
+struct ufs_domain {
+	struct generic_pm_domain genpd;
+	struct ufs_power *power;
+	const struct ufs_protection *protection;
+	unsigned int nprotection;
+	u32 offset;
+	bool phy;
+	bool rtff_saved;
+};
+
+struct ufs_power {
+	struct device *dev;
+	void __iomem *base;
+	struct regmap *bus[UFS_BUS_COUNT];
+	struct mutex lock;
+	bool faulted;
+	bool ready;
+	struct ufs_domain domain[2];
+	struct generic_pm_domain *slots[UFS_PD_COUNT];
+	struct genpd_onecell_data onecell;
+};
+
+static bool enable;
+module_param(enable, bool, 0400);
+MODULE_PARM_DESC(enable, "DANGEROUS: explicitly enable isolated UFS power experiment (default false)");
+
+static void ufs_update(struct ufs_domain *d, u32 mask, u32 bits)
+{
+	void __iomem *addr = d->power->base + d->offset;
+
+	writel((readl(addr) & ~mask) | bits, addr);
+}
+
+static int ufs_poll(struct ufs_domain *d, u32 mask, u32 expected)
+{
+	u32 value;
+
+	return readl_poll_timeout(d->power->base + d->offset, value,
+				  (value & mask) == expected,
+				  UFS_POLL_US, UFS_TIMEOUT_US);
+}
+
+/* Vendor enable retry <= 10: exactly eleven total write/readback attempts. */
+static int ufs_protect(struct ufs_domain *d, unsigned int index, bool set)
+{
+	const struct ufs_protection *p = &d->protection[index];
+	struct regmap *map = d->power->bus[p->type];
+	unsigned int value;
+	int ret, attempt;
+
+	for (attempt = 0; attempt < (set ? 11 : 1); attempt++) {
+		ret = regmap_write(map, set ? p->set : p->clear, p->mask);
+		if (ret)
+			return ret;
+		ret = regmap_read(map, p->enable, &value);
+		if (ret)
+			return ret;
+		if ((value & p->mask) == (set ? p->mask : 0))
+			break;
+	}
+	if (attempt == (set ? 11 : 1))
+		return -EIO;
+	if (!set)
+		return 0; /* BUS_PROT_IGN: never poll clear status ACK. */
+	return regmap_read_poll_timeout(map, p->status, value,
+				       (value & p->mask) == p->mask,
+				       UFS_POLL_US, UFS_TIMEOUT_US);
+}
+
+static int ufs_protect_all(struct ufs_domain *d)
+{
+	int i, j, ret, rollback;
+
+	for (i = 0; i < d->nprotection; i++) {
+		ret = ufs_protect(d, i, true);
+		if (!ret)
+			continue;
+		/* No SRAM/power changes yet; include uncertain failed stage. */
+		for (j = i; j >= 0; j--) {
+			rollback = ufs_protect(d, j, false);
+			if (rollback)
+				dev_err(d->power->dev,
+					"%s bus rollback step %d failed: %d\n",
+					d->genpd.name, j, rollback);
+		}
+		return ret;
+	}
+	return 0;
+}
+
+/* Read-only admission check: do not normalize or repair unknown states. */
+static int ufs_state(struct ufs_domain *d)
+{
+	struct ufs_power *power = d->power;
+	u32 value = readl(power->base + d->offset);
+	bool on;
+	unsigned int i, en, ack;
+	int ret;
+
+	if ((value & UFS_STATE_MASK) == UFS_STATE_ON)
+		on = true;
+	else if ((value & UFS_STATE_MASK) == UFS_STATE_OFF)
+		on = false;
+	else
+		return -EUCLEAN;
+	if (d->phy && (value & (UFS_RTFF_SAVE | UFS_RTFF_CLK_DIS)))
+		return -EUCLEAN;
+	for (i = 0; i < d->nprotection; i++) {
+		const struct ufs_protection *p = &d->protection[i];
+
+		ret = regmap_read(power->bus[p->type], p->enable, &en);
+		if (ret)
+			return ret;
+		if ((en & p->mask) != (on ? 0 : p->mask))
+			return -EUCLEAN;
+		if (on)
+			continue; /* Clear ACK can be held by other voters. */
+		ret = regmap_read(power->bus[p->type], p->status, &ack);
+		if (ret)
+			return ret;
+		if ((ack & p->mask) != p->mask)
+			return -EUCLEAN;
+	}
+	/* Ensure control/status did not change during the syscon reads. */
+	if (readl(power->base + d->offset) != value)
+		return -EUCLEAN;
+	return on;
+}
+
+static int ufs_on_sequence(struct ufs_domain *d)
+{
+	int i, ret;
+
+	if (d->phy && !d->rtff_saved)
+		return -EUCLEAN;
+	ufs_update(d, UFS_ON, UFS_ON);
+	ret = ufs_poll(d, UFS_ACK, UFS_ACK);
+	if (ret)
+		return ret;
+	udelay(50);
+	ufs_update(d, UFS_ON_2ND, UFS_ON_2ND);
+	ret = ufs_poll(d, UFS_ACK_2ND, UFS_ACK_2ND);
+	if (ret)
+		return ret;
+	ufs_update(d, UFS_CLK_DIS, 0);
+	ufs_update(d, UFS_ISO, 0);
+	ufs_update(d, UFS_RST_B, UFS_RST_B);
+	if (d->phy) {
+		ufs_update(d, UFS_RTFF_CLK_DIS, UFS_RTFF_CLK_DIS);
+		ufs_update(d, UFS_RTFF_NRESTORE, 0);
+		ufs_update(d, UFS_RTFF_NRESTORE, UFS_RTFF_NRESTORE);
+		ufs_update(d, UFS_RTFF_CLK_DIS, 0);
+	}
+	ufs_update(d, UFS_SRAM_PDN, 0);
+	ret = ufs_poll(d, UFS_SRAM_ACK, 0);
+	if (ret)
+		return ret;
+	ufs_update(d, UFS_SRAM_ISOINT_B, UFS_SRAM_ISOINT_B);
+	udelay(1);
+	ufs_update(d, UFS_SRAM_CLKISO, 0);
+	for (i = d->nprotection - 1; i >= 0; i--) {
+		ret = ufs_protect(d, i, false);
+		if (ret)
+			return ret;
+	}
+	return 0;
+}
+
+static int ufs_off_sequence(struct ufs_domain *d)
+{
+	int ret;
+
+	ret = ufs_protect_all(d);
+	if (ret)
+		return ret;
+	/* Vendor order: CLKISO, ISOINT_B, delay, then SRAM_PDN. */
+	ufs_update(d, UFS_SRAM_CLKISO, UFS_SRAM_CLKISO);
+	ufs_update(d, UFS_SRAM_ISOINT_B, 0);
+	udelay(1);
+	ufs_update(d, UFS_SRAM_PDN, UFS_SRAM_PDN);
+	ret = ufs_poll(d, UFS_SRAM_ACK, UFS_SRAM_ACK);
+	if (ret)
+		return ret;
+	if (d->phy) {
+		ufs_update(d, UFS_RTFF_CLK_DIS, UFS_RTFF_CLK_DIS);
+		ufs_update(d, UFS_RTFF_SAVE, UFS_RTFF_SAVE);
+		ufs_update(d, UFS_RTFF_SAVE, 0);
+		ufs_update(d, UFS_RTFF_CLK_DIS, 0);
+	}
+	ufs_update(d, UFS_ISO, UFS_ISO);
+	ufs_update(d, UFS_RST_B, 0);
+	ufs_update(d, UFS_CLK_DIS, UFS_CLK_DIS);
+	ufs_update(d, UFS_ON, 0);
+	ret = ufs_poll(d, UFS_ACK, 0);
+	if (ret)
+		return ret;
+	ufs_update(d, UFS_ON_2ND, 0);
+	return ufs_poll(d, UFS_ACK_2ND, 0);
+}
+
+static int ufs_transition(struct generic_pm_domain *genpd, bool on)
+{
+	struct ufs_domain *d = container_of(genpd, struct ufs_domain, genpd);
+	struct ufs_power *power = d->power;
+	int state, ret;
+
+	mutex_lock(&power->lock);
+	if (!power->ready) {
+		ret = -EAGAIN;
+		goto out;
+	}
+	if (power->faulted) {
+		ret = -EIO;
+		goto out;
+	}
+	state = ufs_state(d);
+	if (state < 0) {
+		ret = state;
+		goto fault;
+	}
+	if (state == on) {
+		ret = 0;
+		goto out;
+	}
+	ret = on ? ufs_on_sequence(d) : ufs_off_sequence(d);
+	if (ret)
+		goto fault;
+	state = ufs_state(d);
+	if (state != on) {
+		ret = state < 0 ? state : -EUCLEAN;
+		goto fault;
+	}
+	if (d->phy)
+		d->rtff_saved = !on;
+	goto out;
+ fault:
+	power->faulted = true;
+	dev_err(power->dev,
+		"%s %s failed: %d; controller faulted, hardware state NOT recovered\n",
+		genpd->name, on ? "on" : "off", ret);
+ out:
+	mutex_unlock(&power->lock);
+	return ret;
+}
+
+static int ufs_power_on(struct generic_pm_domain *genpd)
+{
+	return ufs_transition(genpd, true);
+}
+
+static int ufs_power_off(struct generic_pm_domain *genpd)
+{
+	return ufs_transition(genpd, false);
+}
+
+static int ufs_power_probe(struct platform_device *pdev)
+{
+	static const char * const properties[UFS_BUS_COUNT] = {
+		"mediatek,infracfg", "mediatek,vlpcfg", "mediatek,ufscfg-ao",
+	};
+	struct device *dev = &pdev->dev;
+	struct ufs_power *power;
+	struct resource *res;
+	int states[2], i, ret, initialized = 0;
+	u32 cells;
+
+	if (!enable)
+		return dev_err_probe(dev, -EOPNOTSUPP,
+				     "disabled; requires explicit experimental opt-in\n");
+	if (!IS_ENABLED(CONFIG_PM_GENERIC_DOMAINS_OF))
+		return -EOPNOTSUPP;
+	ret = of_property_read_u32(dev->of_node, "#power-domain-cells", &cells);
+	if (ret || cells != 1)
+		return -EINVAL;
+	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+	if (!res || resource_size(res) < 0xe18)
+		return -EINVAL;
+	power = devm_kzalloc(dev, sizeof(*power), GFP_KERNEL);
+	if (!power)
+		return -ENOMEM;
+	power->dev = dev;
+	mutex_init(&power->lock);
+	power->base = devm_platform_ioremap_resource(pdev, 0);
+	if (IS_ERR(power->base))
+		return PTR_ERR(power->base);
+	for (i = 0; i < UFS_BUS_COUNT; i++) {
+		power->bus[i] = syscon_regmap_lookup_by_phandle(dev->of_node,
+							      properties[i]);
+		if (IS_ERR(power->bus[i]))
+			return dev_err_probe(dev, PTR_ERR(power->bus[i]),
+					     "missing/invalid %s\n", properties[i]);
+	}
+	/* Linux 6.1 provider registration requires NULL holes, not ERR_PTR.
+	 * Its default onecell xlate turns every NULL hole into ERR_PTR(-ENOENT).
+	 */
+	for (i = 0; i < 2; i++) {
+		struct ufs_domain *d = &power->domain[i];
+
+		d->power = power;
+		d->phy = i == 1;
+		d->offset = i ? 0xe14 : 0xe10;
+		d->protection = i ? ufs_phy_protection : ufs_host_protection;
+		d->nprotection = i ? ARRAY_SIZE(ufs_phy_protection) :
+				    ARRAY_SIZE(ufs_host_protection);
+		d->genpd.name = i ? "ufs0_phy_shutdown_experimental" :
+				    "ufs0_shutdown_experimental";
+		d->genpd.power_on = ufs_power_on;
+		d->genpd.power_off = ufs_power_off;
+		states[i] = ufs_state(d);
+		if (states[i] < 0 || (d->phy && !states[i]))
+			return dev_err_probe(dev, -EUCLEAN,
+				"%s unknown/inconsistent initial state or missing RTFF provenance\n",
+				d->genpd.name);
+	}
+	/* Both domains checked before exposing either to genpd. No boot writes. */
+	for (i = 0; i < 2; i++) {
+		struct ufs_domain *d = &power->domain[i];
+
+		ret = pm_genpd_init(&d->genpd, NULL, !states[i]);
+		if (ret)
+			goto undo;
+		initialized++;
+		power->slots[UFS_PD_FIRST + i] = &d->genpd;
+	}
+	power->onecell.domains = power->slots;
+	power->onecell.num_domains = UFS_PD_COUNT;
+	ret = of_genpd_add_provider_onecell(dev->of_node, &power->onecell);
+	if (ret)
+		goto undo;
+	mutex_lock(&power->lock);
+	power->ready = true;
+	mutex_unlock(&power->lock);
+	dev_warn(dev, "EXPERIMENTAL UFS domains 2/3 enabled; static lifetime, no hardware validation\n");
+	return 0;
+ undo:
+	while (initialized--) {
+		int cleanup = pm_genpd_remove(&power->domain[initialized].genpd);
+
+		if (cleanup)
+			dev_err(dev, "unpublished genpd cleanup failed: %d\n", cleanup);
+	}
+	return ret;
+}
+
+static const struct of_device_id ufs_power_of_match[] = {
+	{ .compatible = "mediatek,mt6985-ufs-power-experimental" },
+	{ }
+};
+
+static struct platform_driver ufs_power_driver = {
+	.probe = ufs_power_probe,
+	.driver = {
+		.name = "mt6985-ufs-power-experimental",
+		.of_match_table = ufs_power_of_match,
+		.suppress_bind_attrs = true,
+	},
+};
+builtin_platform_driver(ufs_power_driver);
+
+MODULE_DESCRIPTION("Opt-in built-in MT6985 UFS power-domain isolation experiment");
+MODULE_LICENSE("GPL");

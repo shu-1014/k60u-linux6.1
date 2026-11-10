@@ -36,7 +36,11 @@ jobs:
           diff --strip-trailing-cr -u ../ports/mt6985/linux-6.1/drivers/ufs/host/ufs-mediatek.c drivers/ufs/host/ufs-mediatek.c
           make defconfig
           scripts/config --enable SCSI_UFSHCD --enable SCSI_UFSHCD_PLATFORM --enable SCSI_UFS_MEDIATEK
+          scripts/config --enable PM --enable PM_GENERIC_DOMAINS --enable PM_GENERIC_DOMAINS_OF --enable MFD_SYSCON
           make olddefconfig
+          grep -qx 'CONFIG_PM_GENERIC_DOMAINS_OF=y' .config
+          diff --strip-trailing-cr -u ../ports/mt6985/linux-6.1/drivers/soc/mediatek/mt6985-ufs-power-experimental.c drivers/soc/mediatek/mt6985-ufs-power-experimental.c
+          make -j"$(nproc)" drivers/soc/mediatek/mt6985-ufs-power-experimental.o
           diff --strip-trailing-cr -u ../ports/mt6985/linux-6.1/drivers/clk/mediatek/clk-mt6985-bus.c drivers/clk/mediatek/clk-mt6985-bus.c
           make -j"$(nproc)" drivers/clk/mediatek/clk-mt6985-peri.o drivers/clk/mediatek/clk-mt6985-bus.o drivers/ufs/host/ufs-mediatek.o
           aarch64-linux-gnu-readelf -h drivers/clk/mediatek/clk-mt6985-peri.o
@@ -48,6 +52,7 @@ jobs:
           path: |
             linux-6.1/drivers/clk/mediatek/clk-mt6985-peri.o
             linux-6.1/drivers/clk/mediatek/clk-mt6985-bus.o
+            linux-6.1/drivers/soc/mediatek/mt6985-ufs-power-experimental.o
             linux-6.1/drivers/ufs/host/ufs-mediatek.o
             ports/mt6985/provenance.json
           if-no-files-found: error
