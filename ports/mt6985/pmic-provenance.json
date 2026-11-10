@@ -1,0 +1,31 @@
+{
+  "repository": "https://github.com/MiCode/Xiaomi_Kernel_OpenSource",
+  "commit": "cb2ab59a621b17aafa4a3f349c84d9f18adf7aaf",
+  "files": [
+    {
+      "path": "drivers/regulator/mt6363-regulator.c",
+      "sha256": "5103f926597d3f5feb9d165ea4e6473048d03b1a25db9fd40718438ae7a3be99"
+    },
+    {
+      "path": "drivers/regulator/mt6373-regulator.c",
+      "sha256": "a084748c7c83f2848f52cd97981a6c6edb39c03dcc5402bcf8b3cac3f542e49e"
+    },
+    {
+      "path": "include/linux/regulator/mt6363-regulator.h",
+      "sha256": "2382d5399daff51abc081ff515ffe7070d9a0bc425aae019f0224df9cdf28173"
+    },
+    {
+      "path": "include/linux/regulator/mt6373-regulator.h",
+      "sha256": "6dbd641089b08aab9375bc39c404174205986d8823c6979231be16e3d9ec7e7e"
+    },
+    {
+      "path": "include/linux/mfd/mt6363/registers.h",
+      "sha256": "b98079fc18ead9885c157f10af201fdb283619636eb9e0ff01f99011bb0e8206"
+    },
+    {
+      "path": "include/linux/mfd/mt6373/registers.h",
+      "sha256": "8342ff7b51bf5bb9efabb91b0d999820212737a3797df07fc178176e2043c89e"
+    }
+  ],
+  "scope": "Unchanged vendor regulator data/ops with immutable probe rejection; no platform integration or voltage validation"
+}
