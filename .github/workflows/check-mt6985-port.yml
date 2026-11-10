@@ -41,12 +41,16 @@ jobs:
           make defconfig
           scripts/config --enable SCSI_UFSHCD --enable SCSI_UFSHCD_PLATFORM --enable SCSI_UFS_MEDIATEK
           scripts/config --enable PM --enable PM_GENERIC_DOMAINS --enable PM_GENERIC_DOMAINS_OF --enable MFD_SYSCON
-          scripts/config --enable REGULATOR --enable REGMAP
+          scripts/config --enable REGULATOR --enable REGMAP --enable SPMI --enable REGMAP_SPMI --enable MFD_CORE --enable IRQ_DOMAIN
           make olddefconfig
           for f in drivers/regulator/mt6363-regulator.c drivers/regulator/mt6373-regulator.c include/linux/regulator/mt6363-regulator.h include/linux/regulator/mt6373-regulator.h include/linux/mfd/mt6363/registers.h include/linux/mfd/mt6373/registers.h; do
             diff --strip-trailing-cr -u "../ports/mt6985/linux-6.1/$f" "$f"
           done
-          make -j"$(nproc)" drivers/regulator/mt6363-regulator.o drivers/regulator/mt6373-regulator.o
+          for f in drivers/mfd/mtk-spmi-pmic-experimental.c include/linux/mfd/mt6363/core.h include/linux/mfd/mt6373/core.h; do
+            diff --strip-trailing-cr -u "../ports/mt6985/linux-6.1/$f" "$f"
+          done
+          grep -qx 'CONFIG_REGMAP_SPMI=y' .config
+          make -j"$(nproc)" drivers/mfd/mtk-spmi-pmic-experimental.o drivers/regulator/mt6363-regulator.o drivers/regulator/mt6373-regulator.o
           grep -qx 'CONFIG_PM_GENERIC_DOMAINS_OF=y' .config
           diff --strip-trailing-cr -u ../ports/mt6985/linux-6.1/drivers/soc/mediatek/mt6985-ufs-power-experimental.c drivers/soc/mediatek/mt6985-ufs-power-experimental.c
           make -j"$(nproc)" drivers/soc/mediatek/mt6985-ufs-power-experimental.o
@@ -65,6 +69,8 @@ jobs:
             linux-6.1/drivers/ufs/host/ufs-mediatek.o
             linux-6.1/drivers/regulator/mt6363-regulator.o
             linux-6.1/drivers/regulator/mt6373-regulator.o
+            linux-6.1/drivers/mfd/mtk-spmi-pmic-experimental.o
+            ports/mt6985/MFD-REVIEW.md
             ports/mt6985/PMIC-DEPENDENCIES.md
             ports/mt6985/provenance.json
             ports/mt6985/power-provenance.json
