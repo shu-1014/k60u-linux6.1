@@ -442,17 +442,25 @@ static int mt6363_regulator_set_load(struct regulator_dev *rdev, int load_uA)
 
 static int mt6363_vemc_set_voltage_sel(struct regulator_dev *rdev, unsigned int sel)
 {
-	int ret;
-	u16 buf = MT6363_TMA_UNLOCK_VALUE;
+	int ret, lock_ret;
+	const u8 unlock[] = { MT6363_TMA_UNLOCK_VALUE & 0xff,
+			      MT6363_TMA_UNLOCK_VALUE >> 8 };
+	const u8 lock[] = { 0, 0 };
 	unsigned int val = 0;
 
-	ret = regmap_bulk_write(rdev->regmap, MT6363_TOP_TMA_KEY_L, &buf, 2);
+	if (sel >= rdev->desc->n_voltages ||
+	    (sel & ~rdev->desc->vsel_mask))
+		return -EINVAL;
+
+	/* A failed split write may already have changed the first key byte. */
+	ret = regmap_bulk_write(rdev->regmap, MT6363_TOP_TMA_KEY_L,
+				unlock, ARRAY_SIZE(unlock));
 	if (ret)
-		return ret;
+		goto relock;
 
 	ret = regmap_read(rdev->regmap, MT6363_TOP_TRAP, &val);
 	if (ret)
-		return ret;
+		goto relock;
 	switch (val) {
 	case 0:
 		/* If HW trapping is 0, use VEMC_VOSEL_0 */
@@ -467,14 +475,17 @@ static int mt6363_vemc_set_voltage_sel(struct regulator_dev *rdev, unsigned int 
 					 rdev->desc->vsel_mask << 4, sel << 4);
 		break;
 	default:
+		ret = -EINVAL;
 		break;
 	}
-	if (ret)
-		return ret;
-
-	buf = 0;
-	ret = regmap_bulk_write(rdev->regmap, MT6363_TOP_TMA_KEY_L, &buf, 2);
-	return ret;
+relock:
+	/* Best effort only: PMIF submission does not prove hardware relock. */
+	lock_ret = regmap_bulk_write(rdev->regmap, MT6363_TOP_TMA_KEY_L,
+				    lock, ARRAY_SIZE(lock));
+	if (lock_ret)
+		dev_err(&rdev->dev, "VEMC relock failed: %d (operation: %d)\n",
+			lock_ret, ret);
+	return ret ? ret : lock_ret;
 }
 
 static int mt6363_vemc_get_voltage_sel(struct regulator_dev *rdev)

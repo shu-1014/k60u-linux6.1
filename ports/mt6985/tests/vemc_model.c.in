@@ -1,0 +1,222 @@
+/* Userspace control-flow model, not Linux regmap or a hardware emulator. */
+#include <errno.h>
+#include <limits.h>
+#include <stdarg.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+typedef uint8_t u8;
+#define ARRAY_SIZE(x) (sizeof(x) / sizeof((x)[0]))
+@VEMC_DEFINES@
+
+#define CHECK(x) do { if (!(x)) { \
+ fprintf(stderr, "FAIL line %d: %s\n", __LINE__, #x); exit(1); \
+} } while (0)
+
+enum { UNLOCK_ERROR = -101, READ_ERROR = -102, UPDATE_ERROR = -103,
+       LOCK_ERROR = -104, VSEL_REG = 0x1234 };
+struct event { char kind; unsigned int reg, mask, value; int ret; };
+struct regmap {
+    struct event trace[32];
+    unsigned int count, bulk_calls, dev_errors;
+    unsigned int trap, voltage;
+    u8 key[2];
+    int unlock_fail, lock_fail, read_fail, update_fail;
+};
+struct regulator_desc { unsigned int n_voltages, vsel_mask, vsel_reg; };
+struct device { struct regmap *map; };
+struct regulator_dev {
+    struct regmap *regmap;
+    struct regulator_desc *desc;
+    struct device dev;
+};
+
+static void record(struct regmap *m, char kind, unsigned int reg,
+                   unsigned int mask, unsigned int value, int ret)
+{
+    CHECK(m->count < ARRAY_SIZE(m->trace));
+    m->trace[m->count++] = (struct event){ kind, reg, mask, value, ret };
+}
+
+/* A two-byte bulk is split into ordered single-byte submissions, stopping
+ * at the first error. This is a fake of the use_single_write behavior,
+ * NOT the kernel regmap implementation or PMIF completion semantics. */
+static int regmap_bulk_write(struct regmap *m, unsigned int reg,
+                             const void *data, size_t count)
+{
+    const u8 *bytes = data;
+    unsigned int i;
+    int locking = m->bulk_calls++ != 0;
+    int fail = locking ? m->lock_fail : m->unlock_fail;
+    CHECK(m->bulk_calls <= 2);
+    CHECK(count == 2);
+    record(m, locking ? 'L' : 'U', reg, 0, (unsigned int)count, 0);
+    for (i = 0; i < count; i++) {
+        int ret = fail == (int)i + 1 ?
+                  (locking ? LOCK_ERROR : UNLOCK_ERROR) : 0;
+        record(m, locking ? 'l' : 'u', reg + i, 0, bytes[i], ret);
+        if (ret)
+            return ret;
+        CHECK(reg == MT6363_TOP_TMA_KEY_L);
+        m->key[i] = bytes[i];
+    }
+    return 0;
+}
+
+static int regmap_read(struct regmap *m, unsigned int reg, unsigned int *value)
+{
+    int ret = m->read_fail ? READ_ERROR : 0;
+    record(m, 'R', reg, 0, 0, ret);
+    CHECK(reg == MT6363_TOP_TRAP);
+    if (!ret)
+        *value = m->trap;
+    return ret;
+}
+
+static int regmap_update_bits(struct regmap *m, unsigned int reg,
+                              unsigned int mask, unsigned int value)
+{
+    int ret = m->update_fail ? UPDATE_ERROR : 0;
+    record(m, 'V', reg, mask, value, ret);
+    CHECK(reg == VSEL_REG);
+    if (!ret)
+        m->voltage = (m->voltage & ~mask) | (value & mask);
+    return ret;
+}
+
+static void dev_err(struct device *dev, const char *format, ...)
+{
+    va_list ap;
+    int lock_ret, original;
+    va_start(ap, format);
+    lock_ret = va_arg(ap, int);
+    original = va_arg(ap, int);
+    va_end(ap);
+    dev->map->dev_errors++;
+    record(dev->map, 'E', 0, 0, (unsigned int)original, lock_ret);
+}
+
+@VEMC_SETTER@
+
+/* Independent oracle: literal 0x9c9c, literal trap masks and shifted sel.
+ * No expected key, mask, or address is computed from extracted defines. */
+static void expect_event(struct regmap *m, unsigned int *pos, char kind,
+                         unsigned int reg, unsigned int mask,
+                         unsigned int value, int ret)
+{
+    struct event *e;
+    CHECK(*pos < m->count);
+    e = &m->trace[(*pos)++];
+    CHECK(e->kind == kind);
+    CHECK(e->reg == reg);
+    CHECK(e->mask == mask);
+    CHECK(e->value == value);
+    CHECK(e->ret == ret);
+}
+
+static void run_case(unsigned int trap, unsigned int sel,
+                     unsigned int n_voltages, unsigned int vsel_mask,
+                     int invalid, int uf, int rf, int vf, int lf)
+{
+    struct regmap m = { .trap = trap, .voltage = 0xa5,
+        .key = { 0x12, 0x34 }, .unlock_fail = uf, .read_fail = rf,
+        .update_fail = vf, .lock_fail = lf };
+    struct regulator_desc desc = { n_voltages, vsel_mask, VSEL_REG };
+    struct regulator_dev rdev = { &m, &desc, { &m } };
+    unsigned int pos = 0, i, expected_voltage = 0xa5;
+    int original = 0, ret;
+    ret = mt6363_vemc_set_voltage_sel(&rdev, sel);
+    if (invalid) {
+        CHECK(ret == -EINVAL);
+        CHECK(m.count == 0 && m.bulk_calls == 0 && m.dev_errors == 0);
+        CHECK(m.voltage == 0xa5 && m.key[0] == 0x12 && m.key[1] == 0x34);
+        return;
+    }
+    expect_event(&m, &pos, 'U', 0x39e, 0, 2, 0);
+    for (i = 1; i <= 2; i++) {
+        int error = uf == (int)i ? UNLOCK_ERROR : 0;
+        expect_event(&m, &pos, 'u', 0x39d + i, 0, 0x9c, error);
+        if (error) {
+            original = error;
+            break;
+        }
+    }
+    if (!original) {
+        expect_event(&m, &pos, 'R', 0x36, 0, 0, rf ? READ_ERROR : 0);
+        if (rf)
+            original = READ_ERROR;
+        else if (trap > 1)
+            original = -EINVAL;
+        else {
+            unsigned int mask = trap ? 0xf0 : 0x0f;
+            unsigned int value = trap ? sel << 4 : sel;
+            expect_event(&m, &pos, 'V', 0x1234, mask, value,
+                         vf ? UPDATE_ERROR : 0);
+            if (vf)
+                original = UPDATE_ERROR;
+            else
+                expected_voltage = (0xa5 & ~mask) | (value & mask);
+        }
+    }
+    /* Every unlock attempt, including byte-one failure, MUST reach L. */
+    expect_event(&m, &pos, 'L', 0x39e, 0, 2, 0);
+    for (i = 1; i <= 2; i++) {
+        int error = lf == (int)i ? LOCK_ERROR : 0;
+        expect_event(&m, &pos, 'l', 0x39d + i, 0, 0, error);
+        if (error)
+            break;
+    }
+    if (lf)
+        expect_event(&m, &pos, 'E', 0, 0, (unsigned int)original, LOCK_ERROR);
+    CHECK(pos == m.count);
+    CHECK(m.bulk_calls == 2);
+    CHECK(m.dev_errors == (unsigned int)(lf != 0));
+    CHECK(ret == (original ? original : lf ? LOCK_ERROR : 0));
+    CHECK(m.voltage == expected_voltage);
+    if (!lf)
+        CHECK(m.key[0] == 0 && m.key[1] == 0);
+    if (lf == 2)
+        CHECK(m.key[0] == 0);
+}
+
+int main(void)
+{
+    unsigned int sel, trap;
+    int uf, lf;
+    for (sel = 0; sel < 16; sel++)
+        run_case(0, sel, 16, 15, 0, 0, 0, 0, 0);
+    puts("ok 1 - trap 0: all 16 selectors, literal low mask and key");
+    for (sel = 0; sel < 16; sel++)
+        run_case(1, sel, 16, 15, 0, 0, 0, 0, 0);
+    puts("ok 2 - trap 1: all 16 selectors, literal high mask and shift");
+    run_case(0, 16, 16, 15, 1, 0, 0, 0, 0);
+    run_case(0, UINT_MAX, 16, 15, 1, 0, 0, 0, 0);
+    run_case(0, 8, 16, 7, 1, 0, 0, 0, 0);
+    run_case(0, 10, 10, 15, 1, 0, 0, 0, 0);
+    run_case(0, 0, 0, 15, 1, 0, 0, 0, 0);
+    puts("ok 3 - invalid selectors: range and mask reject without bus traffic");
+    for (lf = 0; lf <= 2; lf++) {
+        run_case(2, 3, 16, 15, 0, 0, 0, 0, lf);
+        run_case(UINT_MAX, 3, 16, 15, 0, 0, 0, 0, lf);
+    }
+    puts("ok 4 - invalid trap: no update, relock, original error priority");
+    for (uf = 1; uf <= 2; uf++)
+        for (lf = 0; lf <= 2; lf++)
+            run_case(0, 3, 16, 15, 0, uf, 0, 0, lf);
+    puts("ok 5 - unlock byte 1/2 failure: relock attempt and double errors");
+    for (lf = 0; lf <= 2; lf++)
+        run_case(0, 3, 16, 15, 0, 0, 1, 0, lf);
+    puts("ok 6 - trap read failure: no update, relock and double errors");
+    for (trap = 0; trap <= 1; trap++)
+        for (lf = 0; lf <= 2; lf++)
+            run_case(trap, 3, 16, 15, 0, 0, 0, 1, lf);
+    puts("ok 7 - update failure: both traps, relock and double errors");
+    for (trap = 0; trap <= 1; trap++)
+        for (lf = 1; lf <= 2; lf++)
+            run_case(trap, 3, 16, 15, 0, 0, 0, 0, lf);
+    puts("ok 8 - successful operation plus relock byte 1/2 failure and dev_err");
+    puts("PASS: 8 VEMC userspace model groups (not hardware validation)");
+    return 0;
+}

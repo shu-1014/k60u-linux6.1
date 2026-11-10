@@ -1,12 +1,14 @@
 # Regulator safety repair prerequisites
 
-No runtime activation. This is a scoped next-stage plan, not implemented fixes.
+No runtime activation. The VEMC protected-write error-path repair is implemented as an isolated incremental candidate; delayed-work/reprobe repairs below remain a next-stage plan.
 
 ## MT6363 VEMC protected write
 
 Existing set_voltage_sel unlocks two TMA key bytes, reads TOP_TRAP, writes selected VEMC field, then relocks. A failed trap read or selector update currently returns without relocking; an unsupported trap can return success. Repairs must attempt relock even after an unlock failure because regmap single-value splitting can leave the first key byte written. Preserve first operation error, expose relock error if no earlier error, and report both when needed. Use explicit u8[2] key bytes rather than host-endian u16 memory. Reject unsupported trap and out-of-range selectors before changing voltage. A return from PMIF submit-only write is still not hardware confirmation of unlock/relock.
 
-An extracted actual-C fault model should fail each unlock byte/step, trap read, selected update and relock; verify cleanup attempt, field0/field1 selection, error precedence and no silent unsupported trap. This cannot prove PMIC protected-write protocol or correctness of split two-byte transactions.
+The candidate now uses explicit key bytes, validates selector bounds, returns EINVAL for unsupported trap and always attempts relock after an unlock attempt, including failure. The first operation error wins; relock errors are logged and returned when there was no earlier error. Relock is best effort, with no persistent hardware-state recovery guarantee. The TMA key is shared PMIC state: a per-regulator/core lock does not establish serialization with all other protected-key users. Regmap locks each individual operation, not the whole unlock/read/update/relock sequence. Global key ownership and recovery after relock failure remain deployment blockers.
+
+An extracted actual-C fault model injects failures into unlock bytes, trap read, selected update and relock, and checks cleanup attempt, field0/field1 selection, error precedence and unsupported trap. This cannot prove PMIC protected-write protocol or correctness of split two-byte transactions.
 
 ## Delayed OC work and reprobe
 

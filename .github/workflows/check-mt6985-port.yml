@@ -21,6 +21,8 @@ jobs:
           sudo apt-get install -y --no-install-recommends build-essential flex bison bc libssl-dev libelf-dev gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu
       - name: Execute candidate C models and source contracts
         run: |
+          python3 ports/mt6985/tests/run_vemc_model.py
+          python3 ports/mt6985/tests/run_vemc_model.py --cc 'gcc -fsanitize=address,undefined -fno-omit-frame-pointer'
           python3 ports/mt6985/tests/run_rcs_lifetime_model.py
           python3 ports/mt6985/tests/run_rcs_lifetime_model.py --cc 'gcc -fsanitize=address,undefined -fno-omit-frame-pointer'
           python3 ports/mt6985/tests/run_rcs_model.py
