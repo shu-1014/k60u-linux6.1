@@ -2,7 +2,7 @@
 
 `run_pmif_model.py` extracts the real definitions from
 `../linux-6.1/drivers/spmi/spmi-mt6985-experimental.c`, starting at
-`MT6985_PMIF_DELAY_US` and ending immediately before the probe. The extracted
+`MT6985_PMIF_DELAY_US` and ending at the explicit `RCS IRQ implementation begins` marker, before the IRQ helpers. The extracted
 fragment includes the macros, enums, register/clock arrays, controller-private
 struct, and the exact `mt6985_pmif_wait`, `mt6985_pmif_read_cmd`,
 `mt6985_pmif_write_cmd`, and `mt6985_pmif_cmd` function bodies. It is inserted

@@ -18,19 +18,16 @@
  *   recipe or proof that this controller can be used.
  * - SPMI-P (pmif-p / spmimst-p) is NOT supported.  Retaining all six vendor
  *   clock names does not implement P-channel routing or power management.
- * - RCS SID irqdomain is deliberately NOT implemented.  Vendor lines
- *   1022..1140 use irq_bus_lock/sync_unlock with a mutex, software SID
- *   enable flags, four byte-lane W1C status registers, nested threads and
- *   a threaded SoC rcs_irq parent.  A future port must review SID bounds,
- *   mapping/unmapping, parent registration before child probing and wake
- *   balancing.  Never hold the bus mutex or this raw lock across
- *   handle_nested_irq(): child paths can re-enter the bus/IRQ chip.
- *   Parent IRQ disable/synchronize/free must precede domain destruction,
- *   controller put and MMIO/clock release on failure AND remove.  Do not
- *   copy vendor's devm IRQ + early domain/controller destruction ordering.
- *   There is no IRQ handler/domain here that can outlive this controller.
- * - No AEE, sysfs, debug, event or nack IRQ machinery is imported.  The
- *   missing SoC RCS IRQ path means PMIC child interrupt delivery is absent.
+ * - RCS SID delivery follows vendor lines 1022..1140: software SID
+ *   filtering, four byte-lane W1C registers and a threaded rcs_irq parent.
+ *   SID masking is NOT hardware masking.  No transaction lock or IRQ bus
+ *   mutex is held over nested callbacks, which can re-enter transport.
+ *   Children are removed before the parent IRQ is freed/synchronized,
+ *   then SID mappings/domain are disposed before clocks/controller storage.
+ *   Wakeup is not enabled and suspend semantics remain unverified.
+ * - No AEE, sysfs, debug, event or nack IRQ machinery is imported.  RCS
+ *   status read/clear has no error return or timeout/ACK verification;
+ *   the vendor 0xff byte clear is retained, not proof against lost events.
  * - Non-data commands are unsupported: the inherited OP_ST_STA BUSY==1
  *   poll is not established completion/ACK semantics for this hardware.
  * - Writes retain the 6.1/vendor submit-only algorithm.  Returning zero
@@ -49,8 +46,12 @@
 #include <linux/errno.h>
 #include <linux/io.h>
 #include <linux/iopoll.h>
+#include <linux/interrupt.h>
+#include <linux/irq.h>
+#include <linux/irqdomain.h>
 #include <linux/module.h>
 #include <linux/of.h>
+#include <linux/of_irq.h>
 #include <linux/platform_device.h>
 #include <linux/spinlock.h>
 #include <linux/spmi.h>
@@ -148,6 +149,10 @@ struct mt6985_pmif_experimental {
 	raw_spinlock_t lock;
 	bool online;
 	bool failed;
+	struct irq_domain *rcs_domain;
+	int rcs_irq;
+	bool rcs_irq_requested;
+	bool rcs_enabled[16];
 };
 
 /* Caller holds lock for the whole transaction, including timeout handling. */
@@ -255,6 +260,153 @@ static int mt6985_pmif_cmd(struct spmi_controller *ctrl, u8 opc, u8 sid)
 	return -EOPNOTSUPP;
 }
 
+/* RCS IRQ implementation begins. */
+static void mt6985_pmif_rcs_mask(struct irq_data *data)
+{
+	struct mt6985_pmif_experimental *pmif = irq_data_get_irq_chip_data(data);
+	irq_hw_number_t sid = irqd_to_hwirq(data);
+
+	/* Software dispatch filter only; no hardware SID mask is known.
+	 * Status is still cleared while masked; replay is not guaranteed.
+	 */
+	if (sid < ARRAY_SIZE(pmif->rcs_enabled))
+		WRITE_ONCE(pmif->rcs_enabled[sid], false);
+}
+
+static void mt6985_pmif_rcs_unmask(struct irq_data *data)
+{
+	struct mt6985_pmif_experimental *pmif = irq_data_get_irq_chip_data(data);
+	irq_hw_number_t sid = irqd_to_hwirq(data);
+
+	if (sid < ARRAY_SIZE(pmif->rcs_enabled))
+		WRITE_ONCE(pmif->rcs_enabled[sid], true);
+}
+
+static const struct irq_chip mt6985_pmif_rcs_chip = {
+	.name = "mt6985-pmif-rcs",
+	.irq_mask = mt6985_pmif_rcs_mask,
+	.irq_unmask = mt6985_pmif_rcs_unmask,
+};
+
+static int mt6985_pmif_rcs_map(struct irq_domain *domain, unsigned int virq,
+			      irq_hw_number_t sid)
+{
+	struct mt6985_pmif_experimental *pmif = domain->host_data;
+	int ret;
+
+	if (sid >= ARRAY_SIZE(pmif->rcs_enabled))
+		return -EINVAL;
+	ret = irq_set_parent(virq, pmif->rcs_irq);
+	if (ret)
+		return ret;
+	WRITE_ONCE(pmif->rcs_enabled[sid], false);
+	irq_set_chip_data(virq, pmif);
+	irq_set_chip(virq, &mt6985_pmif_rcs_chip);
+	irq_set_nested_thread(virq, 1);
+	irq_set_noprobe(virq);
+	return 0;
+}
+
+static void mt6985_pmif_rcs_unmap(struct irq_domain *domain, unsigned int virq)
+{
+	struct irq_data *data = irq_get_irq_data(virq);
+
+	if (data)
+		mt6985_pmif_rcs_mask(data);
+	irq_set_nested_thread(virq, 0);
+	irq_set_parent(virq, 0);
+	irq_set_chip(virq, NULL);
+	irq_set_chip_data(virq, NULL);
+}
+
+static const struct irq_domain_ops mt6985_pmif_rcs_domain_ops = {
+	.map = mt6985_pmif_rcs_map,
+	.unmap = mt6985_pmif_rcs_unmap,
+	.xlate = irq_domain_xlate_onetwocell,
+};
+
+static irqreturn_t mt6985_pmif_rcs_thread(int irq, void *data)
+{
+	struct mt6985_pmif_experimental *pmif = data;
+	unsigned int sid, shift, status, virq;
+	void __iomem *reg;
+
+	for (sid = 0; sid < ARRAY_SIZE(pmif->rcs_enabled); sid++) {
+		reg = pmif->spmimst_base + pmif->spmimst_regs[
+			MT6985_SPMI_SLV_3_0_EINT + sid / 4];
+		shift = (sid % 4) * 8;
+		status = (readl(reg) >> shift) & 0xff;
+		/* Vendor policy: clear the entire byte, even if status was zero.
+		 * This can discard a newly arriving event; no ACK is available.
+		 */
+		writel(0xffU << shift, reg);
+		if (!status || !READ_ONCE(pmif->rcs_enabled[sid]))
+			continue;
+		virq = irq_find_mapping(pmif->rcs_domain, sid);
+		/* Independent RCS registers; never hold transport/IRQ bus locks
+		 * across callbacks, which may transact or mask/unmask a SID.
+		 */
+		if (virq)
+			handle_nested_irq(virq);
+	}
+	return IRQ_HANDLED;
+}
+
+static void mt6985_pmif_rcs_exit(struct mt6985_pmif_experimental *pmif)
+{
+	unsigned int sid, virq;
+
+	/* Caller has removed controller children. free_irq waits for threads. */
+	if (pmif->rcs_irq_requested) {
+		free_irq(pmif->rcs_irq, pmif);
+		pmif->rcs_irq_requested = false;
+	}
+	if (!pmif->rcs_domain)
+		return;
+	for (sid = 0; sid < ARRAY_SIZE(pmif->rcs_enabled); sid++) {
+		WRITE_ONCE(pmif->rcs_enabled[sid], false);
+		virq = irq_find_mapping(pmif->rcs_domain, sid);
+		if (virq)
+			irq_dispose_mapping(virq);
+	}
+	irq_domain_remove(pmif->rcs_domain);
+	pmif->rcs_domain = NULL;
+}
+
+static int mt6985_pmif_rcs_init(struct platform_device *pdev,
+			       struct mt6985_pmif_experimental *pmif)
+{
+	unsigned int sid;
+	int ret;
+
+	ret = of_irq_get_byname(pdev->dev.of_node, "rcs_irq");
+	if (ret < 0)
+		return ret; /* In particular, preserve -EPROBE_DEFER. */
+	if (!ret)
+		return -EINVAL;
+	pmif->rcs_irq = ret;
+	pmif->rcs_domain = irq_domain_add_linear(pdev->dev.of_node,
+		ARRAY_SIZE(pmif->rcs_enabled), &mt6985_pmif_rcs_domain_ops, pmif);
+	if (!pmif->rcs_domain)
+		return -ENOMEM;
+
+	/* Vendor initialization discards pending bootloader events.  MMIO
+	 * clear has no timeout/error/ACK result; it is not verified quiescence.
+	 */
+	for (sid = 0; sid < ARRAY_SIZE(pmif->rcs_enabled); sid++)
+		writel(0xffU << ((sid % 4) * 8), pmif->spmimst_base +
+		       pmif->spmimst_regs[MT6985_SPMI_SLV_3_0_EINT + sid / 4]);
+	ret = request_threaded_irq(pmif->rcs_irq, NULL, mt6985_pmif_rcs_thread,
+				   IRQF_ONESHOT, "mt6985-pmif-rcs", pmif);
+	if (ret) {
+		mt6985_pmif_rcs_exit(pmif);
+		return ret;
+	}
+	pmif->rcs_irq_requested = true;
+	/* Do not guess IRQF_NO_SUSPEND or enable parent wakeup by default. */
+	return 0;
+}
+
 static int mt6985_pmif_experimental_probe(struct platform_device *pdev)
 {
 	struct spmi_controller *ctrl;
@@ -294,12 +446,19 @@ static int mt6985_pmif_experimental_probe(struct platform_device *pdev)
 	ctrl->read_cmd = mt6985_pmif_read_cmd;
 	ctrl->write_cmd = mt6985_pmif_write_cmd;
 	pmif->online = true;
+	/* RCS domain and parent must exist before children can request IRQs. */
+	ret = mt6985_pmif_rcs_init(pdev, pmif);
+	if (ret)
+		goto disable_clks;
 	platform_set_drvdata(pdev, ctrl);
 	ret = spmi_controller_add(ctrl);
 	if (ret)
-		goto disable_clks;
+		goto exit_rcs;
 	return 0;
 
+exit_rcs:
+	/* 6.1 add failure has not registered controller children. */
+	mt6985_pmif_rcs_exit(pmif);
 disable_clks:
 	platform_set_drvdata(pdev, NULL);
 	clk_bulk_disable_unprepare(ARRAY_SIZE(pmif->clks), pmif->clks);
@@ -316,6 +475,7 @@ static int mt6985_pmif_experimental_remove(struct platform_device *pdev)
 
 	/* Children may need working transport during their remove callbacks. */
 	spmi_controller_remove(ctrl);
+	mt6985_pmif_rcs_exit(pmif);
 	raw_spin_lock_irqsave(&pmif->lock, flags);
 	pmif->online = false;
 	raw_spin_unlock_irqrestore(&pmif->lock, flags);

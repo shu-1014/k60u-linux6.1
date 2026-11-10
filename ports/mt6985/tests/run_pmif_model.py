@@ -18,7 +18,7 @@ DEFAULT_SOURCE = HERE.parent / "linux-6.1/drivers/spmi/spmi-mt6985-experimental.
 def extract(source: str) -> str:
     """Retain exact source bytes between explicitly checked integration boundaries."""
     start = source.index("#define MT6985_PMIF_DELAY_US")
-    end = source.index("static int mt6985_pmif_experimental_probe(", start)
+    end = source.index("/* RCS IRQ implementation begins. */", start)
     fragment = source[start:end]
     names = re.findall(r"^static (?:void|int) (mt6985_\w+)\(", fragment, re.M)
     expected = ["mt6985_pmif_wait", "mt6985_pmif_read_cmd",
