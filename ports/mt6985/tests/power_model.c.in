@@ -1,0 +1,369 @@
+/* SPDX-License-Identifier: GPL-2.0-only
+ * Userspace peripheral model, not a replacement transition algorithm.
+ * The marker below is replaced with verbatim candidate C by the generator.
+ */
+#include <stdbool.h>
+#include <stdint.h>
+#include <stddef.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <errno.h>
+#ifndef EUCLEAN
+#define EUCLEAN 117
+#endif
+
+typedef uint32_t u32;
+#define __iomem
+#define BIT(n) (UINT32_C(1) << (n))
+#define USEC_PER_SEC 1000000
+#define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
+#define container_of(p, type, member) ((type *)((char *)(p) - offsetof(type, member)))
+#define CHECK(c) do { if (!(c)) { fprintf(stderr, "FAIL %s:%d: %s\n", __func__, __LINE__, #c); exit(1); } } while (0)
+struct device { int unused; };
+struct generic_pm_domain { const char *name; };
+struct genpd_onecell_data { struct generic_pm_domain **domains; unsigned int num_domains; };
+struct mutex { bool held; };
+struct regmap { unsigned int id; u32 regs[0x300 / 4]; };
+static void mutex_lock(struct mutex *m) { CHECK(!m->held); m->held = true; }
+static void mutex_unlock(struct mutex *m) { CHECK(m->held); m->held = false; }
+static unsigned int errors;
+#define dev_err(dev, ...) do { (void)(dev); errors++; } while (0)
+static void udelay(unsigned int us);
+static u32 readl(const void *addr);
+static void writel(u32 value, void *addr);
+static int regmap_write(struct regmap *map, unsigned int reg, unsigned int value);
+static int regmap_read(struct regmap *map, unsigned int reg, unsigned int *value);
+/* Bounded deterministic repeated reads: hardware time is not simulated. */
+#define readl_poll_timeout(addr, value, condition, delay, timeout) \
+({ int rc_ = -ETIMEDOUT; (void)(delay); (void)(timeout); \
+   for (int k_ = 0; k_ < 4; k_++) { (value) = readl(addr); \
+     if (condition) { rc_ = 0; break; } } rc_; })
+#define regmap_read_poll_timeout(map, reg, value, condition, delay, timeout) \
+({ int rc_ = -ETIMEDOUT; (void)(delay); (void)(timeout); \
+   for (int k_ = 0; k_ < 4; k_++) { \
+     int rr_ = regmap_read(map, reg, &(value)); \
+     if (rr_) { rc_ = rr_; break; } \
+     if (condition) { rc_ = 0; break; } } rc_; })
+
+/* @CANDIDATE@ */
+
+enum event_type { MMIO, BUS, READ_BUS, DELAY };
+struct event { enum event_type type; unsigned int id, reg; u32 before, value; };
+static struct event trace[512];
+static unsigned int ntrace, bus_writes, bus_reads;
+static u32 spm[0xe18 / 4];
+static struct regmap maps[UFS_BUS_COUNT];
+static struct ufs_power power;
+static struct device device;
+static u32 freeze_ack; /* ACK bits held at their previous level. */
+static bool hold_clear_status, suppress_set_ack;
+static unsigned int fail_write_at, fail_read_at, fail_write_again_at;
+static unsigned int suppress_enable_writes;
+
+static void log_event(enum event_type type, unsigned int id, unsigned int reg,
+                      u32 before, u32 value)
+{
+    CHECK(ntrace < ARRAY_SIZE(trace));
+    trace[ntrace++] = (struct event){type, id, reg, before, value};
+}
+static void udelay(unsigned int us) { log_event(DELAY, 0, 0, 0, us); }
+static u32 readl(const void *addr) { return *(const u32 *)addr; }
+static void writel(u32 value, void *addr)
+{
+    u32 old = *(u32 *)addr;
+    unsigned int offset = (unsigned int)((unsigned char *)addr - (unsigned char *)spm);
+    CHECK(offset == 0xe10 || offset == 0xe14);
+    log_event(MMIO, 0, offset, old, value);
+    /* Status is read-only. ON and SRAM controls drive automatic ACKs. */
+    u32 ack = old & (UFS_ACK_MASK | UFS_SRAM_ACK);
+    const u32 controls[] = {UFS_ON, UFS_ON_2ND, UFS_SRAM_PDN};
+    const u32 statuses[] = {UFS_ACK, UFS_ACK_2ND, UFS_SRAM_ACK};
+    for (unsigned int i = 0; i < ARRAY_SIZE(controls); i++) {
+        if (freeze_ack & statuses[i])
+            continue;
+        ack = (ack & ~statuses[i]) | ((value & controls[i]) ? statuses[i] : 0);
+    }
+    *(u32 *)addr = (value & ~(UFS_ACK_MASK | UFS_SRAM_ACK)) | ack;
+}
+static const struct ufs_protection *lookup(struct regmap *map, unsigned int reg, bool *set)
+{
+    for (unsigned int d = 0; d < 2; d++) {
+        const struct ufs_domain *domain = &power.domain[d];
+        for (unsigned int i = 0; i < domain->nprotection; i++) {
+            const struct ufs_protection *p = &domain->protection[i];
+            if (map->id == (unsigned int)p->type && (reg == p->set || reg == p->clear)) {
+                *set = reg == p->set;
+                return p;
+            }
+        }
+    }
+    CHECK(false);
+    return NULL;
+}
+static int regmap_write(struct regmap *map, unsigned int reg, unsigned int value)
+{
+    bool set;
+    const struct ufs_protection *p = lookup(map, reg, &set);
+    log_event(BUS, map->id, reg, map->regs[p->enable / 4], value);
+    bus_writes++;
+    /* Even a failed write may have a partial device effect: apply first. */
+    if (set) {
+        if (suppress_enable_writes) suppress_enable_writes--;
+        else map->regs[p->enable / 4] |= value;
+        if (!suppress_set_ack) map->regs[p->status / 4] |= value;
+    } else {
+        map->regs[p->enable / 4] &= ~value;
+        if (!hold_clear_status) map->regs[p->status / 4] &= ~value;
+    }
+    return (bus_writes == fail_write_at || bus_writes == fail_write_again_at) ? -EIO : 0;
+}
+static int regmap_read(struct regmap *map, unsigned int reg, unsigned int *value)
+{
+    CHECK(reg < sizeof(map->regs));
+    bus_reads++;
+    log_event(READ_BUS, map->id, reg, 0, map->regs[reg / 4]);
+    if (bus_reads == fail_read_at) return -EIO;
+    *value = map->regs[reg / 4];
+    return 0;
+}
+static void reset(void)
+{
+    memset(&power, 0, sizeof(power));
+    memset(spm, 0, sizeof(spm));
+    memset(maps, 0, sizeof(maps));
+    ntrace = bus_writes = bus_reads = errors = 0;
+    freeze_ack = 0;
+    fail_write_at = fail_read_at = fail_write_again_at = suppress_enable_writes = 0;
+    hold_clear_status = suppress_set_ack = false;
+    power.dev = &device;
+    power.base = spm;
+    power.ready = true;
+    for (unsigned int i = 0; i < UFS_BUS_COUNT; i++) {
+        maps[i].id = i;
+        power.bus[i] = &maps[i];
+    }
+    /* Fixture only: probe is intentionally not extracted or called. */
+    for (unsigned int i = 0; i < 2; i++) {
+        struct ufs_domain *d = &power.domain[i];
+        d->power = &power;
+        d->phy = i == 1;
+        d->offset = i ? 0xe14 : 0xe10;
+        d->protection = i ? ufs_phy_protection : ufs_host_protection;
+        d->nprotection = i ? ARRAY_SIZE(ufs_phy_protection) : ARRAY_SIZE(ufs_host_protection);
+        d->genpd.name = i ? "phy" : "host";
+        spm[d->offset / 4] = UFS_STATE_ON | (i ? UFS_RTFF_NRESTORE : 0);
+    }
+}
+static int transition(unsigned int d, bool on)
+{
+    int ret = ufs_transition(&power.domain[d].genpd, on);
+    CHECK(!power.lock.held);
+    return ret;
+}
+static unsigned int write_count(void)
+{
+    unsigned int n = 0;
+    for (unsigned int i = 0; i < ntrace; i++) n += trace[i].type == MMIO || trace[i].type == BUS;
+    return n;
+}
+static void clear_trace(void) { ntrace = bus_writes = bus_reads = 0; }
+static void make_off(unsigned int index)
+{
+    struct ufs_domain *d = &power.domain[index];
+    spm[d->offset / 4] = UFS_STATE_OFF | (index ? UFS_RTFF_NRESTORE : 0);
+    for (unsigned int i = 0; i < d->nprotection; i++) {
+        const struct ufs_protection *p = &d->protection[i];
+        maps[p->type].regs[p->enable / 4] |= p->mask;
+        maps[p->type].regs[p->status / 4] |= p->mask;
+    }
+}
+struct step { u32 mask, bits; };
+/* Exact MMIO write sequence, independent of the candidate implementation. */
+static const struct step off_steps[] = {
+    {UFS_SRAM_CLKISO, UFS_SRAM_CLKISO}, {UFS_SRAM_ISOINT_B, 0},
+    {UFS_SRAM_PDN, UFS_SRAM_PDN},
+    {UFS_ISO, UFS_ISO}, {UFS_RST_B, 0}, {UFS_CLK_DIS, UFS_CLK_DIS},
+    {UFS_ON, 0}, {UFS_ON_2ND, 0},
+};
+static const struct step save_steps[] = {
+    {UFS_RTFF_CLK_DIS, UFS_RTFF_CLK_DIS}, {UFS_RTFF_SAVE, UFS_RTFF_SAVE},
+    {UFS_RTFF_SAVE, 0}, {UFS_RTFF_CLK_DIS, 0},
+};
+static const struct step on_steps[] = {
+    {UFS_ON, UFS_ON}, {UFS_ON_2ND, UFS_ON_2ND}, {UFS_CLK_DIS, 0},
+    {UFS_ISO, 0}, {UFS_RST_B, UFS_RST_B}, {UFS_SRAM_PDN, 0},
+    {UFS_SRAM_ISOINT_B, UFS_SRAM_ISOINT_B}, {UFS_SRAM_CLKISO, 0},
+};
+static const struct step restore_steps[] = {
+    {UFS_RTFF_CLK_DIS, UFS_RTFF_CLK_DIS}, {UFS_RTFF_NRESTORE, 0},
+    {UFS_RTFF_NRESTORE, UFS_RTFF_NRESTORE}, {UFS_RTFF_CLK_DIS, 0},
+};
+static unsigned int cursor;
+static struct event next_write(void)
+{
+    while (cursor < ntrace && trace[cursor].type == READ_BUS) cursor++;
+    CHECK(cursor < ntrace);
+    return trace[cursor++];
+}
+static void expect_bus(const struct ufs_protection *p, bool set)
+{
+    struct event e = next_write();
+    CHECK(e.type == BUS && e.id == (unsigned int)p->type);
+    CHECK(e.reg == (set ? p->set : p->clear) && e.value == p->mask);
+}
+static void expect_mmio(const struct ufs_domain *d, struct step step)
+{
+    struct event e = next_write();
+    CHECK(e.type == MMIO && e.reg == d->offset);
+    CHECK(e.value == ((e.before & ~step.mask) | step.bits));
+}
+static void expect_sequence(unsigned int index, bool on)
+{
+    const struct ufs_domain *d = &power.domain[index];
+    cursor = 0;
+    if (!on)
+        for (unsigned int i = 0; i < d->nprotection; i++) expect_bus(&d->protection[i], true);
+    const struct step *steps = on ? on_steps : off_steps;
+    for (unsigned int i = 0; i < ARRAY_SIZE(off_steps); i++) {
+        /* PHY save after SRAM ACK; restore after reset, before SRAM on. */
+        unsigned int insertion = on ? 5 : 3;
+        if (d->phy && i == insertion)
+            for (unsigned int j = 0; j < ARRAY_SIZE(save_steps); j++)
+                expect_mmio(d, on ? restore_steps[j] : save_steps[j]);
+        expect_mmio(d, steps[i]);
+        if ((on && (i == 0 || i == 6)) || (!on && i == 1)) {
+            struct event delay = next_write();
+            CHECK(delay.type == DELAY && delay.value == ((on && i == 0) ? 50U : 1U));
+        }
+    }
+    if (on)
+        for (int i = (int)d->nprotection - 1; i >= 0; i--) expect_bus(&d->protection[i], false);
+    while (cursor < ntrace && trace[cursor].type == READ_BUS) cursor++;
+    CHECK(cursor == ntrace);
+}
+static void test_round_trip(void)
+{
+    for (unsigned int i = 0; i < 2; i++) {
+        reset();
+        CHECK(transition(i, false) == 0);
+        CHECK(!power.faulted && ufs_state(&power.domain[i]) == 0);
+        CHECK(power.domain[i].rtff_saved == (i == 1));
+        expect_sequence(i, false);
+        clear_trace();
+        CHECK(transition(i, true) == 0);
+        CHECK(!power.faulted && ufs_state(&power.domain[i]) == 1);
+        CHECK(!power.domain[i].rtff_saved);
+        expect_sequence(i, true);
+        clear_trace();
+        CHECK(transition(i, true) == 0 && write_count() == 0);
+    }
+}
+static void test_provenance_and_shared_fault(void)
+{
+    reset(); make_off(1);
+    CHECK(transition(1, true) == -EUCLEAN);
+    CHECK(power.faulted && write_count() == 0);
+    CHECK(transition(0, false) == -EIO && write_count() == 0);
+    reset();
+    spm[0xe14 / 4] |= UFS_RTFF_SAVE;
+    CHECK(transition(1, false) == -EUCLEAN && write_count() == 0);
+    CHECK(transition(0, false) == -EIO && write_count() == 0);
+}
+static void test_ready_and_mixed(void)
+{
+    reset(); power.ready = false;
+    CHECK(transition(0, false) == -EAGAIN && transition(1, false) == -EAGAIN);
+    CHECK(!power.faulted && ntrace == 0);
+    reset(); spm[0xe10 / 4] ^= UFS_ON_2ND;
+    CHECK(transition(0, false) == -EUCLEAN && write_count() == 0 && power.faulted);
+    CHECK(transition(1, false) == -EIO && write_count() == 0);
+}
+static void test_power_timeouts(void)
+{
+    const u32 ack[] = {UFS_ACK, UFS_ACK_2ND, UFS_SRAM_ACK};
+    for (unsigned int i = 0; i < ARRAY_SIZE(ack); i++) {
+        for (unsigned int on = 0; on < 2; on++) {
+            reset();
+            if (on) make_off(0);
+            freeze_ack = ack[i];
+            CHECK(transition(0, on) == -ETIMEDOUT && power.faulted);
+            CHECK(errors == 1);
+            CHECK(ufs_state(&power.domain[0]) < 0);
+            unsigned int writes = write_count();
+            CHECK(transition(1, false) == -EIO && writes == write_count());
+            /* No fabricated target success, and no guessed power rollback. */
+            if (ack[i] == UFS_SRAM_ACK && !on)
+                CHECK((spm[0xe10 / 4] & UFS_ACK_MASK) == UFS_ACK_MASK);
+        }
+    }
+}
+static void test_bus_rollback(void)
+{
+    for (unsigned int stage = 1; stage <= 3; stage++) {
+        reset(); fail_write_at = stage;
+        CHECK(transition(0, false) == -EIO && power.faulted);
+        cursor = 0;
+        for (unsigned int i = 0; i < stage; i++) expect_bus(&ufs_host_protection[i], true);
+        for (int i = (int)stage - 1; i >= 0; i--) expect_bus(&ufs_host_protection[i], false);
+        CHECK(write_count() == 2 * stage);
+        CHECK(spm[0xe10 / 4] == UFS_STATE_ON);
+        CHECK(ufs_state(&power.domain[0]) == 1);
+    }
+    reset(); fail_write_at = 3; fail_write_again_at = 4;
+    CHECK(transition(0, false) == -EIO && errors == 2);
+    CHECK(bus_writes == 6); /* Rollback continues after its own error. */
+}
+static void test_bus_ack_and_read_errors(void)
+{
+    reset(); suppress_set_ack = true;
+    CHECK(transition(0, false) == -ETIMEDOUT && power.faulted);
+    CHECK(write_count() == 2 && spm[0xe10 / 4] == UFS_STATE_ON);
+    cursor = 0; expect_bus(&ufs_host_protection[0], true); expect_bus(&ufs_host_protection[0], false);
+    reset(); fail_read_at = 1;
+    CHECK(transition(0, false) == -EIO && power.faulted && write_count() == 0);
+    reset(); fail_read_at = 4; /* three admission reads, then first set readback */
+    CHECK(transition(0, false) == -EIO && power.faulted && write_count() == 2);
+}
+static void test_enable_retry(void)
+{
+    reset(); suppress_enable_writes = 10;
+    CHECK(transition(0, false) == 0 && bus_writes == 13);
+    reset(); suppress_enable_writes = 11;
+    CHECK(transition(0, false) == -EIO && power.faulted && bus_writes == 12);
+    CHECK(spm[0xe10 / 4] == UFS_STATE_ON);
+}
+static void test_clear_ign(void)
+{
+    for (unsigned int i = 0; i < 2; i++) {
+        reset(); CHECK(transition(i, false) == 0);
+        clear_trace(); hold_clear_status = true;
+        CHECK(transition(i, true) == 0 && !power.faulted);
+        expect_sequence(i, true);
+        const struct ufs_domain *d = &power.domain[i];
+        unsigned int first_clear = 0;
+        while (first_clear < ntrace && trace[first_clear].type != BUS) first_clear++;
+        CHECK(first_clear < ntrace);
+        for (unsigned int j = 0; j < d->nprotection; j++) {
+            const struct ufs_protection *p = &d->protection[j];
+            CHECK((maps[p->type].regs[p->enable / 4] & p->mask) == 0);
+            CHECK((maps[p->type].regs[p->status / 4] & p->mask) == p->mask);
+            for (unsigned int k = first_clear; k < ntrace; k++)
+                CHECK(!(trace[k].type == READ_BUS && trace[k].id == (unsigned int)p->type && trace[k].reg == p->status));
+        }
+    }
+}
+int main(void)
+{
+#define RUN(test) do { test(); puts("PASS " #test); } while (0)
+    RUN(test_round_trip);
+    RUN(test_provenance_and_shared_fault);
+    RUN(test_ready_and_mixed);
+    RUN(test_power_timeouts);
+    RUN(test_bus_rollback);
+    RUN(test_bus_ack_and_read_errors);
+    RUN(test_enable_retry);
+    RUN(test_clear_ign);
+    puts("PASS all real-candidate model assertions (no hardware validation)");
+    return 0;
+}
