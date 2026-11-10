@@ -5,6 +5,8 @@
 #include <linux/interrupt.h>
 #include <linux/mfd/mt6363/registers.h>
 #include <linux/module.h>
+#include <linux/mutex.h>
+#include <linux/slab.h>
 #include <linux/of_device.h>
 #include <linux/platform_device.h>
 #include <linux/regmap.h>
@@ -52,8 +54,14 @@
  */
 struct mt6363_regulator_info {
 	int irq;
-	int oc_irq_enable_delay_ms;
+	u32 oc_irq_enable_delay_ms;
 	struct delayed_work oc_work;
+	/* Threaded handler and work may call sleeping irqchip bus callbacks. */
+	struct mutex oc_lock;
+	bool stopping;
+	bool irq_disabled;
+	bool irq_requested;
+	struct regulator_dev *rdev;
 	struct regulator_desc desc;
 	u32 lp_mode_reg;
 	u32 lp_mode_mask;
@@ -689,7 +697,7 @@ static int mt6363_of_parse_cb(struct device_node *np,
 			      struct regulator_config *config);
 
 /* The array is indexed by id(MT6363_ID_XXX) */
-static struct mt6363_regulator_info mt6363_regulators[] = {
+static const struct mt6363_regulator_info mt6363_regulators[] = {
 	MT6363_BUCK(VS2, 0, 1600000, 12500, mt_volt_range0,
 		    MT6363_RG_BUCK_VS2_EN_ADDR,
 		    MT6363_RG_BUCK_VS2_EN_SHIFT,
@@ -1004,22 +1012,40 @@ static void mt6363_oc_irq_enable_work(struct work_struct *work)
 	struct mt6363_regulator_info *info
 		= container_of(dwork, struct mt6363_regulator_info, oc_work);
 
-	enable_irq(info->irq);
+	mutex_lock(&info->oc_lock);
+	if (!info->stopping && info->irq_disabled) {
+		enable_irq(info->irq);
+		info->irq_disabled = false;
+	}
+	mutex_unlock(&info->oc_lock);
 }
 
 static irqreturn_t mt6363_oc_irq(int irq, void *data)
 {
-	struct regulator_dev *rdev = (struct regulator_dev *)data;
+	struct regulator_dev *rdev = data;
 	struct mt6363_regulator_info *info = rdev_get_drvdata(rdev);
 
-	disable_irq_nosync(info->irq);
-	if (!regulator_is_enabled_regmap(rdev))
-		goto delayed_enable;
-	regulator_notifier_call_chain(rdev, REGULATOR_EVENT_OVER_CURRENT,
-				      NULL);
-delayed_enable:
-	schedule_delayed_work(&info->oc_work,
-			      msecs_to_jiffies(info->oc_irq_enable_delay_ms));
+	mutex_lock(&info->oc_lock);
+	if (info->stopping) {
+		mutex_unlock(&info->oc_lock);
+		return IRQ_HANDLED;
+	}
+	if (!info->irq_disabled) {
+		disable_irq_nosync(irq);
+		info->irq_disabled = true;
+	}
+	mutex_unlock(&info->oc_lock);
+
+	/* Do not hold oc_lock across a potentially reentrant notifier. */
+	if (regulator_is_enabled_regmap(rdev) > 0)
+		regulator_notifier_call_chain(rdev, REGULATOR_EVENT_OVER_CURRENT,
+					      NULL);
+
+	mutex_lock(&info->oc_lock);
+	if (!info->stopping)
+		schedule_delayed_work(&info->oc_work,
+			msecs_to_jiffies(info->oc_irq_enable_delay_ms));
+	mutex_unlock(&info->oc_lock);
 	return IRQ_HANDLED;
 }
 
@@ -1035,7 +1061,6 @@ static int mt6363_of_parse_cb(struct device_node *np,
 					   &info->oc_irq_enable_delay_ms);
 		if (ret || !info->oc_irq_enable_delay_ms)
 			info->oc_irq_enable_delay_ms = DEFAULT_DELAY_MS;
-		INIT_DELAYED_WORK(&info->oc_work, mt6363_oc_irq_enable_work);
 	}
 	return 0;
 }
@@ -1046,66 +1071,144 @@ static int mt6363_backup_op_setting(struct regmap *map, struct mt6363_regulator_
 	u32 val = 0;
 
 	ret = regmap_read(map, info->op_en_reg + OP_CFG_OFFSET, &info->orig_op_cfg);
-	for (i = 0; i < 3; i++) {
-		ret |= regmap_read(map, info->op_en_reg + i, &val);
-		info->orig_op_en |= val << (i * 8);
-	}
 	if (ret)
 		return ret;
+	for (i = 0; i < 3; i++) {
+		ret = regmap_read(map, info->op_en_reg + i, &val);
+		if (ret)
+			return ret;
+		info->orig_op_en |= val << (i * 8);
+	}
 
 	return 0;
+}
+
+struct mt6363_regulator_data {
+	struct mt6363_regulator_info *regulators;
+};
+
+static void mt6363_stop_oc(struct mt6363_regulator_data *data)
+{
+	struct mt6363_regulator_info *info;
+	int i;
+
+	/*
+	 * Serialize against enable_irq() before freeing any IRQ. Once stopping
+	 * is set, neither the threaded producer nor work can touch IRQ state
+	 * or queue new work. Do not hold oc_lock while waiting for handlers.
+	 */
+	for (i = 0; i < MT6363_MAX_REGULATOR; i++) {
+		info = &data->regulators[i];
+		mutex_lock(&info->oc_lock);
+		info->stopping = true;
+		mutex_unlock(&info->oc_lock);
+	}
+	for (i = 0; i < MT6363_MAX_REGULATOR; i++) {
+		info = &data->regulators[i];
+		if (info->irq_requested) {
+			free_irq(info->irq, info->rdev);
+			info->irq_requested = false;
+		}
+	}
+	/* All handlers have exited; rdev remains alive until devres teardown. */
+	for (i = 0; i < MT6363_MAX_REGULATOR; i++)
+		cancel_delayed_work_sync(&data->regulators[i].oc_work);
+	/*
+	 * These IRQs are not shared. In 6.1, last-action free_irq() calls
+	 * irq_shutdown(), which resets a started descriptor's depth to its
+	 * shutdown baseline of 1; the next irq_startup() resets it to 0.
+	 * Never enable a freed IRQ to "balance" a cancelled OC delay.
+	 */
 }
 
 static int mt6363_regulator_probe(struct platform_device *pdev)
 {
 	/* Compile-only vendor candidate; no runtime override is permitted. */
 	static const bool runtime_review_approved = false;
+	struct regulator_config config = {};
+	struct mt6363_regulator_data *data;
+	struct mt6363_regulator_info *info;
+	int i, ret;
 
 	if (!runtime_review_approved)
 		return -EOPNOTSUPP;
 
-	struct regulator_config config = {};
-	struct regulator_dev *rdev;
-	struct mt6363_regulator_info *info;
-	int i, ret;
-
 	config.dev = pdev->dev.parent;
 	config.regmap = dev_get_regmap(pdev->dev.parent, NULL);
+	if (!config.regmap)
+		return -ENODEV;
+
+	data = devm_kzalloc(&pdev->dev, sizeof(*data), GFP_KERNEL);
+	if (!data)
+		return -ENOMEM;
+	data->regulators = devm_kmemdup(&pdev->dev, mt6363_regulators,
+				       sizeof(mt6363_regulators), GFP_KERNEL);
+	if (!data->regulators)
+		return -ENOMEM;
+	platform_set_drvdata(pdev, data);
+
+	/* Initialize every work, even without an OF node or an optional IRQ. */
 	for (i = 0; i < MT6363_MAX_REGULATOR; i++) {
-		info = &mt6363_regulators[i];
-		info->irq = platform_get_irq_byname_optional(pdev, info->desc.name);
-		config.driver_data = info;
-
-		rdev = devm_regulator_register(&pdev->dev, &info->desc, &config);
-		if (IS_ERR(rdev)) {
-			ret = PTR_ERR(rdev);
-			dev_err(&pdev->dev, "failed to register %s, ret=%d\n",
-				info->desc.name, ret);
-			continue;
-		}
-		if (info->lp_imax_uA) {
-			ret = mt6363_backup_op_setting(config.regmap, info);
-			if (ret) {
-				dev_notice(&pdev->dev, "failed to backup op_setting (%s)\n",
-					   info->desc.name);
-				info->lp_imax_uA = 0;
-			}
-		}
-
-		if (info->irq <= 0)
-			continue;
-		ret = devm_request_threaded_irq(&pdev->dev, info->irq, NULL,
-						mt6363_oc_irq,
-						IRQF_TRIGGER_HIGH,
-						info->desc.name,
-						rdev);
-		if (ret) {
-			dev_err(&pdev->dev, "Failed to request IRQ:%s, ret=%d",
-				info->desc.name, ret);
-			continue;
-		}
+		info = &data->regulators[i];
+		mutex_init(&info->oc_lock);
+		info->oc_irq_enable_delay_ms = DEFAULT_DELAY_MS;
+		INIT_DELAYED_WORK(&info->oc_work, mt6363_oc_irq_enable_work);
 	}
 
+	/* Resolve all IRQs before registering any regulator. */
+	for (i = 0; i < MT6363_MAX_REGULATOR; i++) {
+		info = &data->regulators[i];
+		ret = platform_get_irq_byname_optional(pdev, info->desc.name);
+		if (ret == -ENXIO) {
+			info->irq = 0;
+			continue;
+		}
+		if (ret <= 0) {
+			ret = ret ? ret : -EINVAL;
+			goto err_stop_oc;
+		}
+		info->irq = ret;
+	}
+
+	for (i = 0; i < MT6363_MAX_REGULATOR; i++) {
+		info = &data->regulators[i];
+		config.driver_data = info;
+		if (info->lp_imax_uA) {
+			ret = mt6363_backup_op_setting(config.regmap, info);
+			if (ret)
+				goto err_stop_oc;
+		}
+
+		info->rdev = devm_regulator_register(&pdev->dev, &info->desc, &config);
+		if (IS_ERR(info->rdev)) {
+			ret = PTR_ERR(info->rdev);
+			dev_err(&pdev->dev, "failed to register %s, ret=%d\n",
+				info->desc.name, ret);
+			goto err_stop_oc;
+		}
+		if (!info->irq)
+			continue;
+		ret = request_threaded_irq(info->irq, NULL, mt6363_oc_irq,
+					   IRQF_TRIGGER_HIGH, info->desc.name,
+					   info->rdev);
+		if (ret) {
+			dev_err(&pdev->dev, "Failed to request IRQ:%s, ret=%d\n",
+				info->desc.name, ret);
+			goto err_stop_oc;
+		}
+		info->irq_requested = true;
+	}
+
+	return 0;
+
+err_stop_oc:
+	mt6363_stop_oc(data);
+	return ret;
+}
+
+static int mt6363_regulator_remove(struct platform_device *pdev)
+{
+	mt6363_stop_oc(platform_get_drvdata(pdev));
 	return 0;
 }
 
@@ -1120,6 +1223,7 @@ static struct platform_driver mt6363_regulator_driver = {
 		.name = "mt6363-regulator",
 	},
 	.probe = mt6363_regulator_probe,
+	.remove = mt6363_regulator_remove,
 	.id_table = mt6363_regulator_ids,
 };
 module_platform_driver(mt6363_regulator_driver);
