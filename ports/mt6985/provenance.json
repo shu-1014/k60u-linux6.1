@@ -1,0 +1,16 @@
+{
+  "repository": "https://github.com/MiCode/Xiaomi_Kernel_OpenSource",
+  "commit": "cb2ab59a621b17aafa4a3f349c84d9f18adf7aaf",
+  "branch": "corot-t-oss",
+  "files": [
+    {
+      "path": "drivers\\clk\\mediatek\\clk-mt6985-peri.c",
+      "sha256": "4135f0878f065544d826553abef0497f93add09410a84cef26c51e305bd96386"
+    },
+    {
+      "path": "include\\dt-bindings\\clock\\mt6985-clk.h",
+      "sha256": "35bd734f06a9a143623624c43833a6ab8f5b23440212bc7b872ae8344865d516"
+    }
+  ],
+  "scope": "Peripheral/UFS clock gate tables only. No topckgen, PLL, power domains, PHY or PMIC port. Not boot tested."
+}

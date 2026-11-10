@@ -1,0 +1,43 @@
+name: Check MT6985 port slice
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  compile-clock-gates:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    env:
+      ARCH: arm64
+      CROSS_COMPILE: aarch64-linux-gnu-
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential flex bison bc libssl-dev libelf-dev gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu
+      - name: Fetch pristine Linux 6.1
+        run: |
+          set -eux
+          curl -fL --retry 3 -o linux.tar.xz https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.1.tar.xz
+          tar xf linux.tar.xz
+      - name: Install port slice and compile object
+        run: |
+          set -eux
+          cp -r ports/mt6985/linux-6.1/. linux-6.1/
+          cd linux-6.1
+          make defconfig
+          make -j"$(nproc)" drivers/clk/mediatek/clk-mt6985-peri.o
+          aarch64-linux-gnu-readelf -h drivers/clk/mediatek/clk-mt6985-peri.o
+          aarch64-linux-gnu-nm drivers/clk/mediatek/clk-mt6985-peri.o | grep -E 'ufsao_clks|ufspdn_clks|of_match_clk_mt6985_peri'
+      - name: Upload object and provenance
+        uses: actions/upload-artifact@v4
+        with:
+          name: mt6985-peripheral-gates-compile-only
+          path: |
+            linux-6.1/drivers/clk/mediatek/clk-mt6985-peri.o
+            ports/mt6985/provenance.json
+          if-no-files-found: error
