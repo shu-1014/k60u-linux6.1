@@ -73,6 +73,7 @@ jobs:
           set -e
           cd "linux-${KVER}"
           cp ../configs/k60u_defconfig .config
+          scripts/config --enable SCSI_UFS_MEDIATEK
           make ARCH=arm64 olddefconfig
           # ---- 关键补丁：崩溃日志(pstore/ramoops) + MTK PMIC(SPMI) ----
           scripts/config --enable PSTORE
@@ -82,9 +83,18 @@ jobs:
           scripts/config --enable SPMI
           scripts/config --enable SPMI_MTK_PMIF
           scripts/config --enable COMMON_CLK_MTK
+          scripts/config --enable WATCHDOG
+          scripts/config --enable WATCHDOG_CORE
+          scripts/config --enable MEDIATEK_WATCHDOG
+          scripts/config --disable WATCHDOG_NOWAYOUT
           make ARCH=arm64 olddefconfig
+          # A matching compatible string alone does not validate MT6985 hardware support.
+          # Keep MT8195 register tables unmodified until MT6985 tables are ported.
+          for opt in SCSI_UFS_MEDIATEK PHY_MTK_UFS; do
+            grep -qx "CONFIG_${opt}=y" .config || { echo "Missing builtin: $opt"; exit 1; }
+          done
           echo "--- key options ---"
-          grep -E '^CONFIG_ARCH_MEDIATEK|^CONFIG_ARM64=|^CONFIG_LOCALVERSION|^CONFIG_PSTORE_RAM|^CONFIG_PSTORE_CONSOLE|^CONFIG_SPMI_MTK_PMIF' .config || true
+          grep -E '^CONFIG_ARCH_MEDIATEK|^CONFIG_ARM64=|^CONFIG_LOCALVERSION|^CONFIG_PSTORE_RAM|^CONFIG_PSTORE_CONSOLE|^CONFIG_SPMI_MTK_PMIF|^CONFIG_MEDIATEK_WATCHDOG|^CONFIG_WATCHDOG=' .config || true
 
       - name: Build Image and device tree
         run: |
@@ -113,6 +123,12 @@ jobs:
         run: |
           set -e
           mkdir -p out
+          printf '%s\n' \
+            'EXPERIMENTAL BUILD - NOT VERIFIED TO BOOT' \
+            'Enabling mainline MTK UFS does not establish MT6985 hardware support.' \
+            'The bringup DT lacks storage/display nodes; stock vendor modules are not guaranteed compatible.' \
+            'Do not treat these artifacts as a working OS4 replacement or flash without a recovery plan.' \
+            > out/EXPERIMENTAL-NOT-BOOT-VERIFIED.txt
           python3 scripts/repack_boot.py \
             bootimg/boot_header.bin \
             "linux-${KVER}/arch/arm64/boot/Image" \
