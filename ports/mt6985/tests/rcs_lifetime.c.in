@@ -1,0 +1,200 @@
+/* Serial API-call model only: no real IRQ threads or kernel lifetime proof. */
+#include <assert.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+#include <errno.h>
+
+#define EPROBE_DEFER 517
+#define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
+#define READ_ONCE(x) (x)
+#define WRITE_ONCE(x, v) ((x) = (v))
+#define IRQF_ONESHOT 0x00002000UL
+#define MT6985_SPMI_SLV_3_0_EINT 0
+struct device_node { int token; };
+struct device { struct device_node *of_node; };
+struct platform_device { struct device dev; };
+struct irq_domain { unsigned int mappings[16]; };
+struct irq_domain_ops { int token; };
+struct mt6985_pmif_experimental {
+    void *spmimst_base;
+    const unsigned int *spmimst_regs;
+    bool rcs_enabled[16];
+    struct irq_domain *rcs_domain;
+    int rcs_irq;
+    bool rcs_irq_requested;
+};
+typedef int (*irq_handler_t)(int, void *);
+static int mt6985_pmif_rcs_thread(int irq, void *data) { return 1; }
+static const struct irq_domain_ops mt6985_pmif_rcs_domain_ops = {0};
+/* Literal hardware oracle, not parsed from or computed using candidate enums. */
+static const unsigned int eint_offsets[] = {0x20, 0x24, 0x28, 0x2c};
+static const uint32_t byte_masks[] = {0x000000ffU, 0x0000ff00U,
+                                     0x00ff0000U, 0xff000000U};
+static uint32_t memory[16];
+static struct device_node node;
+static struct irq_domain domain;
+static struct mt6985_pmif_experimental pmif;
+static struct platform_device pdev;
+static int of_result, request_result;
+static bool fail_domain, live_irq, synchronized, domain_live;
+static unsigned int irq_get_calls, allocations, clears, requests, frees, finds, disposes, removes;
+static unsigned int disposed[16], expected_disposed[16], expected_count;
+enum event { GET, ALLOC, CLEAR, REQUEST, FREE_BEGIN, FREE_SYNC, FIND, DISPOSE, REMOVE };
+static enum event events[128];
+static unsigned int event_count;
+static void record(enum event e) {
+    assert(event_count < ARRAY_SIZE(events));
+    events[event_count++] = e;
+}
+static int of_irq_get_byname(struct device_node *np, const char *name) {
+    assert(np == &node && !strcmp(name, "rcs_irq"));
+    irq_get_calls++; record(GET); return of_result;
+}
+static struct irq_domain *irq_domain_add_linear(struct device_node *np,
+        unsigned int size, const struct irq_domain_ops *ops, void *host_data) {
+    assert(irq_get_calls == 1 && np == &node && size == 16);
+    assert(ops == &mt6985_pmif_rcs_domain_ops && host_data == &pmif);
+    assert(!clears && !requests && !domain_live);
+    allocations++; record(ALLOC);
+    if (fail_domain) return NULL;
+    domain_live = true; return &domain;
+}
+static void writel(uint32_t value, void *reg) {
+    assert(domain_live && !requests && clears < 16);
+    assert(reg == (unsigned char *)memory + eint_offsets[clears / 4]);
+    assert(value == byte_masks[clears % 4]);
+    clears++; record(CLEAR);
+}
+static int request_threaded_irq(unsigned int irq, irq_handler_t handler,
+        irq_handler_t thread, unsigned long flags, const char *name, void *data) {
+    assert(irq == (unsigned int)of_result && handler == NULL);
+    assert(thread == mt6985_pmif_rcs_thread && flags == IRQF_ONESHOT);
+    assert(!strcmp(name, "mt6985-pmif-rcs") && data == &pmif);
+    assert(domain_live && clears == 16 && !pmif.rcs_irq_requested && !live_irq);
+    requests++; record(REQUEST);
+    if (!request_result) live_irq = true;
+    return request_result;
+}
+static void free_irq(unsigned int irq, void *data) {
+    assert(irq == (unsigned int)of_result && data == &pmif);
+    assert(live_irq && pmif.rcs_irq_requested && domain_live);
+    assert(!finds && !disposes && !removes && frees == 0);
+    frees++; record(FREE_BEGIN);
+    /* Mock marker for synchronous return, not a real IRQ/thread simulation. */
+    live_irq = false; synchronized = true; record(FREE_SYNC);
+}
+static unsigned int irq_find_mapping(struct irq_domain *d, unsigned int sid) {
+    assert(d == &domain && domain_live && sid == finds && sid < 16);
+    assert(!live_irq && !pmif.rcs_irq_requested);
+    if (frees) assert(synchronized);
+    assert(!READ_ONCE(pmif.rcs_enabled[sid]));
+    finds++; record(FIND); return d->mappings[sid];
+}
+static void irq_dispose_mapping(unsigned int virq) {
+    assert(domain_live && !live_irq && disposes < expected_count);
+    assert(virq == expected_disposed[disposes]);
+    assert(domain.mappings[finds - 1] == virq);
+    domain.mappings[finds - 1] = 0;
+    disposed[disposes++] = virq; record(DISPOSE);
+}
+static void irq_domain_remove(struct irq_domain *d) {
+    assert(d == &domain && domain_live && !live_irq);
+    assert(finds == 16 && disposes == expected_count && !removes);
+    for (unsigned int sid = 0; sid < 16; sid++) {
+        assert(!pmif.rcs_enabled[sid] && !domain.mappings[sid]);
+    }
+    removes++; domain_live = false; record(REMOVE);
+}
+
+/* Verbatim source slice: exit start through immediately before probe start. */
+@RCS_LIFETIME_FUNCTIONS@
+
+static void reset(void) {
+    memset(&pmif, 0, sizeof(pmif));
+    memset(&domain, 0, sizeof(domain));
+    memset(memory, 0, sizeof(memory));
+    pmif.spmimst_base = memory;
+    pmif.spmimst_regs = eint_offsets;
+    for (unsigned int sid = 0; sid < 16; sid++) pmif.rcs_enabled[sid] = true;
+    pdev.dev.of_node = &node;
+    of_result = 43; request_result = 0;
+    fail_domain = live_irq = synchronized = domain_live = false;
+    irq_get_calls = allocations = clears = requests = frees = finds = disposes = removes = 0;
+    expected_count = event_count = 0;
+    memset(disposed, 0, sizeof(disposed));
+    memset(expected_disposed, 0, sizeof(expected_disposed));
+}
+static void add_mapping(unsigned int sid, unsigned int virq) {
+    assert(sid < 16 && virq && expected_count < 16);
+    domain.mappings[sid] = virq;
+    expected_disposed[expected_count++] = virq;
+}
+static void check_clean(void) {
+    assert(!pmif.rcs_domain && !pmif.rcs_irq_requested && !live_irq && !domain_live);
+    assert(finds == 16 && removes == 1 && disposes == expected_count);
+    for (unsigned int sid = 0; sid < 16; sid++) assert(!pmif.rcs_enabled[sid]);
+}
+static void group1(void) {
+    const int inputs[] = {-EPROBE_DEFER, -EIO, -ENOENT, 0};
+    for (unsigned int i = 0; i < ARRAY_SIZE(inputs); i++) {
+        reset(); of_result = inputs[i];
+        assert(mt6985_pmif_rcs_init(&pdev, &pmif) == (inputs[i] ? inputs[i] : -EINVAL));
+        assert(irq_get_calls == 1 && event_count == 1 && events[0] == GET);
+        assert(!allocations && !clears && !requests && !frees && !removes);
+        assert(!pmif.rcs_domain && !pmif.rcs_irq_requested);
+    }
+    puts("ok 1 - of_irq errors preserved (-EPROBE_DEFER/other negatives); zero -> -EINVAL; no allocation");
+}
+static void group2(void) {
+    reset(); fail_domain = true;
+    assert(mt6985_pmif_rcs_init(&pdev, &pmif) == -ENOMEM);
+    assert(irq_get_calls == 1 && allocations == 1 && event_count == 2);
+    assert(!clears && !requests && !frees && !finds && !removes && !pmif.rcs_domain);
+    puts("ok 2 - NULL domain -> -ENOMEM without clear/request");
+}
+static void group3(void) {
+    reset(); request_result = -EBUSY;
+    assert(mt6985_pmif_rcs_init(&pdev, &pmif) == -EBUSY);
+    assert(clears == 16 && requests == 1 && !frees);
+    check_clean();
+    assert(events[18] == REQUEST && events[19] == FIND);
+    puts("ok 3 - failed request removes domain, never frees unrequested IRQ");
+}
+static void group4(void) {
+    reset(); assert(mt6985_pmif_rcs_init(&pdev, &pmif) == 0);
+    assert(pmif.rcs_domain == &domain && pmif.rcs_irq_requested && live_irq);
+    assert(clears == 16 && requests == 1 && !frees && !finds && !removes);
+    assert(events[0] == GET && events[1] == ALLOC && event_count == 19);
+    for (unsigned int i = 2; i < 18; i++) assert(events[i] == CLEAR);
+    assert(events[18] == REQUEST);
+    puts("ok 4 - success: all 16 literal offset/mask clears precede ONESHOT request");
+}
+static void group5(void) {
+    /* Continue successful fixture from group 4; sparse SIDs and non-linear virqs. */
+    add_mapping(0, 701); add_mapping(3, 47); add_mapping(9, 9001); add_mapping(15, 208);
+    mt6985_pmif_rcs_exit(&pmif);
+    check_clean(); assert(frees == 1 && synchronized);
+    assert(events[19] == FREE_BEGIN && events[20] == FREE_SYNC && events[21] == FIND);
+    assert(events[event_count - 1] == REMOVE);
+    puts("ok 5 - free_irq synchronous-return marker precedes sparse SID0/15 mapping disposal and domain removal; enables false");
+}
+static void group6(void) {
+    unsigned int before = event_count;
+    mt6985_pmif_rcs_exit(&pmif); mt6985_pmif_rcs_exit(&pmif);
+    assert(event_count == before && frees == 1 && removes == 1);
+    reset(); pmif.rcs_domain = &domain; domain_live = true;
+    add_mapping(0, 1301); add_mapping(15, 19);
+    mt6985_pmif_rcs_exit(&pmif); check_clean();
+    assert(!irq_get_calls && !allocations && !requests && !frees && events[0] == FIND);
+    before = event_count; mt6985_pmif_rcs_exit(&pmif);
+    assert(event_count == before && removes == 1);
+    reset(); mt6985_pmif_rcs_exit(&pmif); assert(!event_count);
+    puts("ok 6 - repeat exit has no double cleanup; partial domain-only and empty cleanup are safe in mock");
+}
+int main(void) {
+    group1(); group2(); group3(); group4(); group5(); group6();
+    puts("PASS 6 RCS init/exit serial API groups; not real threading, kernel lifecycle, hardware or pending-event validation");
+    return 0;
+}

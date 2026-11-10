@@ -16,7 +16,18 @@ def check(source=None):
     assert 'raw_spin_lock_irqsave' in s and 'raw_spin_unlock_irqrestore' in s
     assert 'mediatek,mt6985-spmi-experimental' in s
     assert '(bc & 3)' not in s
-    print('PASS vendor channel2 offsets, six clocks, shared lock, unique match and no runtime parameter (static evidence only)')
+    remove=s[s.index('static int mt6985_pmif_experimental_remove('):]
+    order=['spmi_controller_remove(ctrl);','mt6985_pmif_rcs_exit(pmif);','pmif->online = false;','clk_bulk_disable_unprepare(','spmi_controller_put(ctrl);']
+    positions=[remove.index(x) for x in order]
+    assert positions==sorted(positions),'remove resource ownership order'
+    exit=s[s.index('static void mt6985_pmif_rcs_exit('):s.index('static int mt6985_pmif_rcs_init(')]
+    positions=[exit.index(x) for x in ['free_irq(','irq_dispose_mapping(','irq_domain_remove(']]
+    assert positions==sorted(positions),'IRQ teardown synchronization before domain disposal'
+    init=s[s.index('static int mt6985_pmif_rcs_init('):s.index('static int mt6985_pmif_experimental_probe(')]
+    assert 'of_irq_get_byname(pdev->dev.of_node, "rcs_irq")' in init
+    assert 'request_threaded_irq' in init and 'IRQF_ONESHOT' in init
+    assert 'enable_irq_wake(' not in init and 'IRQF_NO_SUSPEND' not in re.sub(r'/\*.*?\*/','',init,flags=re.S)
+    print('PASS vendor offsets/clocks, closed gate, unique match and source teardown ordering (static evidence only)')
 
 if __name__=='__main__':
     check()
