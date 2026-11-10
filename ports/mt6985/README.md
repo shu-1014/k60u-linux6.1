@@ -10,6 +10,8 @@ Branch: `corot-t-oss`. This is a source baseline, not evidence that it matches t
 
 The original MT6985 clock IDs, parents, offsets and gate shifts are retained from `clk-mt6985-peri.c` and `mt6985-clk.h`. The vendor printk-only probe wrapper is replaced with Linux 6.1 `mtk_clk_simple_probe`, `.remove` cleanup and an OF module table. The standalone workflow compiles only this object against pristine Linux 6.1. It does not alter the image-building workflow, DTS, active firmware or phone partitions.
 
+The vendor gate helper implicitly adds `CLK_OPS_PARENT_ENABLE`; the port explicitly supplies this flag in each gate macro because Linux 6.1's helper does not. Plain SET/CLR polarity is unchanged. Runtime-PM association with the provider device differs between frameworks and requires further review before integration.
+
 UFS AO/PDN registers: status 0x4, set 0x8, clear 0xc. AO IDs 0..3 use shifts 0..3 and parents f26m_ck/f26m_ck/f26m_ck/ufs_ck. PDN IDs 0..1 use shifts 0..1 and parents ufs_ck/aes_ufsfde_ck.
 
 Missing parents/topckgen/PLLs, scpsys domains, PMICs and PHY/host changes remain mandatory. A successful object build does not establish working clocks on hardware.

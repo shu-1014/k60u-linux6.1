@@ -29,6 +29,7 @@ static const struct mtk_gate_regs impc_cg_regs = {
 		.regs = &impc_cg_regs,			\
 		.shift = _shift,			\
 		.ops = &mtk_clk_gate_ops_setclr,	\
+		.flags = CLK_OPS_PARENT_ENABLE,	\
 	}
 
 static const struct mtk_gate impc_clks[] = {
@@ -54,6 +55,7 @@ static const struct mtk_gate_regs impn_cg_regs = {
 		.regs = &impn_cg_regs,			\
 		.shift = _shift,			\
 		.ops = &mtk_clk_gate_ops_setclr,	\
+		.flags = CLK_OPS_PARENT_ENABLE,	\
 	}
 
 static const struct mtk_gate impn_clks[] = {
@@ -89,6 +91,7 @@ static const struct mtk_gate_regs imps_cg_regs = {
 		.regs = &imps_cg_regs,			\
 		.shift = _shift,			\
 		.ops = &mtk_clk_gate_ops_setclr,	\
+		.flags = CLK_OPS_PARENT_ENABLE,	\
 	}
 
 static const struct mtk_gate imps_clks[] = {
@@ -138,6 +141,7 @@ static const struct mtk_gate_regs perao2_cg_regs = {
 		.regs = &perao0_cg_regs,			\
 		.shift = _shift,			\
 		.ops = &mtk_clk_gate_ops_setclr,	\
+		.flags = CLK_OPS_PARENT_ENABLE,	\
 	}
 
 #define GATE_PERAO1(_id, _name, _parent, _shift) {	\
@@ -147,6 +151,7 @@ static const struct mtk_gate_regs perao2_cg_regs = {
 		.regs = &perao1_cg_regs,			\
 		.shift = _shift,			\
 		.ops = &mtk_clk_gate_ops_setclr,	\
+		.flags = CLK_OPS_PARENT_ENABLE,	\
 	}
 
 #define GATE_PERAO2(_id, _name, _parent, _shift) {	\
@@ -156,6 +161,7 @@ static const struct mtk_gate_regs perao2_cg_regs = {
 		.regs = &perao2_cg_regs,			\
 		.shift = _shift,			\
 		.ops = &mtk_clk_gate_ops_setclr,	\
+		.flags = CLK_OPS_PARENT_ENABLE,	\
 	}
 
 static const struct mtk_gate perao_clks[] = {
@@ -254,6 +260,7 @@ static const struct mtk_gate_regs pext_cg_regs = {
 		.regs = &pext_cg_regs,			\
 		.shift = _shift,			\
 		.ops = &mtk_clk_gate_ops_setclr,	\
+		.flags = CLK_OPS_PARENT_ENABLE,	\
 	}
 
 static const struct mtk_gate pext_clks[] = {
@@ -301,6 +308,7 @@ static const struct mtk_gate_regs ufsao_cg_regs = {
 		.regs = &ufsao_cg_regs,			\
 		.shift = _shift,			\
 		.ops = &mtk_clk_gate_ops_setclr,	\
+		.flags = CLK_OPS_PARENT_ENABLE,	\
 	}
 
 static const struct mtk_gate ufsao_clks[] = {
@@ -332,6 +340,7 @@ static const struct mtk_gate_regs ufspdn_cg_regs = {
 		.regs = &ufspdn_cg_regs,			\
 		.shift = _shift,			\
 		.ops = &mtk_clk_gate_ops_setclr,	\
+		.flags = CLK_OPS_PARENT_ENABLE,	\
 	}
 
 static const struct mtk_gate ufspdn_clks[] = {
