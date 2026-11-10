@@ -21,6 +21,7 @@ jobs:
           sudo apt-get install -y --no-install-recommends build-essential flex bison bc libssl-dev libelf-dev gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu
       - name: Execute candidate power-sequence model
         run: |
+          python3 ports/mt6985/tests/check_pmif_contract.py
           python3 ports/mt6985/tests/run_power_model.py
           python3 ports/mt6985/tests/run_power_model.py --cc 'gcc -fsanitize=address,undefined -fno-omit-frame-pointer'
       - name: Fetch pristine Linux 6.1
@@ -49,6 +50,8 @@ jobs:
           for f in drivers/mfd/mtk-spmi-pmic-experimental.c include/linux/mfd/mt6363/core.h include/linux/mfd/mt6373/core.h; do
             diff --strip-trailing-cr -u "../ports/mt6985/linux-6.1/$f" "$f"
           done
+          diff --strip-trailing-cr -u ../ports/mt6985/linux-6.1/drivers/spmi/spmi-mt6985-experimental.c drivers/spmi/spmi-mt6985-experimental.c
+          make -j"$(nproc)" drivers/spmi/spmi-mt6985-experimental.o
           grep -qx 'CONFIG_REGMAP_SPMI=y' .config
           make -j"$(nproc)" drivers/mfd/mtk-spmi-pmic-experimental.o drivers/regulator/mt6363-regulator.o drivers/regulator/mt6373-regulator.o
           grep -qx 'CONFIG_PM_GENERIC_DOMAINS_OF=y' .config
@@ -70,6 +73,8 @@ jobs:
             linux-6.1/drivers/regulator/mt6363-regulator.o
             linux-6.1/drivers/regulator/mt6373-regulator.o
             linux-6.1/drivers/mfd/mtk-spmi-pmic-experimental.o
+            linux-6.1/drivers/spmi/spmi-mt6985-experimental.o
+            ports/mt6985/PMIF-REVIEW.md
             ports/mt6985/MFD-REVIEW.md
             ports/mt6985/PMIC-DEPENDENCIES.md
             ports/mt6985/provenance.json
