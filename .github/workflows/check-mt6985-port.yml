@@ -22,6 +22,8 @@ jobs:
       - name: Execute candidate power-sequence model
         run: |
           python3 ports/mt6985/tests/check_pmif_contract.py
+          python3 ports/mt6985/tests/run_pmif_model.py
+          python3 ports/mt6985/tests/run_pmif_model.py --cc 'gcc -fsanitize=address,undefined -fno-omit-frame-pointer'
           python3 ports/mt6985/tests/run_power_model.py
           python3 ports/mt6985/tests/run_power_model.py --cc 'gcc -fsanitize=address,undefined -fno-omit-frame-pointer'
       - name: Fetch pristine Linux 6.1

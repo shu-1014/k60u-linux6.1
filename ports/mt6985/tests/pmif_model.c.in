@@ -1,0 +1,260 @@
+/* SPDX-License-Identifier: GPL-2.0
+ * Userspace harness: only the insertion marker is replaced, without rewriting
+ * candidate function bodies. No probe, real MMIO, or hardware is exercised.
+ */
+#include <assert.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stddef.h>
+#include <stdio.h>
+#include <string.h>
+#include <errno.h>
+
+typedef uint8_t u8;
+typedef uint16_t u16;
+typedef uint32_t u32;
+#define __iomem
+#define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
+#define BIT(n) (1U << (n))
+#define SPMI_CMD_RESET 0x10
+#define SPMI_CMD_WAKEUP 0x13
+struct clk_bulk_data { const char *id; };
+typedef struct { unsigned held, acquisitions, releases; } raw_spinlock_t;
+struct spmi_controller { void *data; };
+static void *spmi_controller_get_drvdata(struct spmi_controller *c) { return c->data; }
+static raw_spinlock_t *active_lock;
+static void lock_take(raw_spinlock_t *l)
+{
+    assert(!l->held && !active_lock);
+    l->held = 1; l->acquisitions++; active_lock = l;
+}
+static void lock_drop(raw_spinlock_t *l)
+{
+    assert(active_lock == l && l->held);
+    l->held = 0; l->releases++; active_lock = NULL;
+}
+#define raw_spin_lock_irqsave(l, flags) do { (flags) = 0; lock_take(l); } while (0)
+#define raw_spin_unlock_irqrestore(l, flags) do { (void)(flags); lock_drop(l); } while (0)
+
+/* Literal offsets and FSM values are intentionally independent of extracted macros. */
+static unsigned char registers[0x1000];
+struct event { char op; unsigned offset; u32 value; };
+static struct event trace[4096];
+static size_t trace_count;
+static unsigned fsm, busy_reads, status_reads, poll_calls;
+static bool initial_stuck, reply_stuck, is_read;
+static void record(char op, const void *p, u32 v)
+{
+    assert(active_lock && active_lock->held);
+    assert((const unsigned char *)p >= registers);
+    assert((const unsigned char *)p < registers + sizeof(registers));
+    assert(trace_count < ARRAY_SIZE(trace));
+    trace[trace_count++] = (struct event){op, (unsigned)((const unsigned char *)p-registers), v};
+}
+static u32 readl(const void *p)
+{
+    unsigned off = (unsigned)((const unsigned char *)p-registers);
+    u32 value;
+    if (off == 0x08a8) {
+        status_reads++;
+        if (initial_stuck) value = 2; /* neither IDLE nor WFVLDCLR */
+        else if (fsm == 1 && busy_reads) { busy_reads--; value = 2; }
+        else if (fsm == 1 && is_read && !reply_stuck) { fsm = 6; value = 12; }
+        else value = fsm << 1;
+    } else {
+        assert(off == 0x0894 && fsm == 6);
+        value = 0xe7c35a91;
+    }
+    record('R', p, value);
+    return value;
+}
+static void writel(u32 value, void *p)
+{
+    unsigned off = (unsigned)((unsigned char *)p-registers);
+    record('W', p, value);
+    if (off == 0x0884) { assert(fsm == 0); }
+    else if (off == 0x0880) {
+        assert(fsm == 0);
+        is_read = !(value & 0x20000000U);
+        fsm = 1;
+    } else {
+        assert(off == 0x08a4 && value == 1 && fsm == 6);
+        fsm = 0;
+    }
+}
+/* Deterministic virtual-time bound; no wall-clock delay. Exactly 1001 reads
+ * maximum for delay=10/timeout=10000, not Linux iopoll's final-read timing. */
+#define readl_poll_timeout_atomic(addr, val, cond, delay, timeout) \
+({ \
+    unsigned _limit; int _ret = -ETIMEDOUT; \
+    assert((delay) == 10 && (timeout) == 10000); \
+    _limit = (timeout) / (delay) + 1; poll_calls++; \
+    while (_limit--) { (val) = readl(addr); if (cond) { _ret = 0; break; } } \
+    _ret; \
+})
+
+/* @CANDIDATE@ */
+
+static struct mt6985_pmif_experimental device;
+static struct spmi_controller controller;
+static const u8 payload[] = {0x91, 0x5a, 0xc3, 0xe7};
+static void reset(void)
+{
+    assert(!active_lock);
+    memset(&device, 0, sizeof(device));
+    device.base = registers; device.spmimst_base = registers;
+    device.spmimst_regs = mt6985_spmimst_regs;
+    device.online = true; controller.data = &device;
+    trace_count = 0; fsm = 0; busy_reads = 0; status_reads = 0; poll_calls = 0;
+    initial_stuck = false; reply_stuck = false; is_read = false;
+}
+static void balanced(void)
+{
+    assert(!active_lock && !device.lock.held);
+    assert(device.lock.acquisitions == device.lock.releases);
+}
+static void event_at(size_t i, char op, unsigned offset, u32 value)
+{
+    assert(i < trace_count);
+    assert(trace[i].op == op && trace[i].offset == offset && trace[i].value == value);
+}
+static void read_case(u8 opc, size_t len, u32 expected)
+{
+    u8 output[6];
+    reset(); memset(output, 0xa6, sizeof(output)); busy_reads = 2;
+    assert(mt6985_pmif_read_cmd(&controller, opc, 0xa, 0x1234, output+1, len) == 0);
+    assert(trace_count == 7 && poll_calls == 2 && !device.failed);
+    event_at(0, 'R', 0x08a8, 0);
+    event_at(1, 'W', 0x0880, expected);
+    event_at(2, 'R', 0x08a8, 2); event_at(3, 'R', 0x08a8, 2);
+    event_at(4, 'R', 0x08a8, 12);
+    event_at(5, 'R', 0x0894, 0xe7c35a91);
+    event_at(6, 'W', 0x08a4, 1);
+    assert(output[0] == 0xa6);
+    for (size_t i = 0; i < len; i++) assert(output[i+1] == payload[i]);
+    for (size_t i = len+1; i < sizeof(output); i++) assert(output[i] == 0xa6);
+    assert(fsm == 0); balanced();
+}
+static void reads(void)
+{
+    /* Literal command words encode type, SID=10, bytecount and address. */
+    read_case(0x60, 1, 0x4a001234); read_case(0x7f, 2, 0x4a011234);
+    read_case(0x20, 3, 0xca021234); read_case(0x2f, 4, 0xca031234);
+    read_case(0x38, 1, 0xca001234); read_case(0x3f, 4, 0xca031234);
+    puts("ok 1 - real read callbacks, literal commands, byte order and canaries");
+}
+static void write_case(u8 opc, size_t len, u32 expected, u32 packed)
+{
+    reset();
+    assert(mt6985_pmif_write_cmd(&controller, opc, 0xa, 0x1234, payload, len) == 0);
+    assert(trace_count == 3 && poll_calls == 1 && status_reads == 1);
+    event_at(0, 'R', 0x08a8, 0);
+    event_at(1, 'W', 0x0884, packed); event_at(2, 'W', 0x0880, expected);
+    /* Trace ends at ACC: there is no completion poll, and FSM is still busy. */
+    assert(fsm == 1 && !device.failed); balanced();
+}
+static void writes(void)
+{
+    write_case(0x40, 1, 0x6a001234, 0x91);
+    write_case(0x5f, 2, 0x6a011234, 0x5a91);
+    write_case(0x00, 3, 0xea021234, 0xc35a91);
+    write_case(0x0f, 4, 0xea031234, 0xe7c35a91);
+    write_case(0x30, 1, 0xea001234, 0x91);
+    write_case(0x37, 4, 0xea031234, 0xe7c35a91);
+    write_case(0x80, 4, 0x2a031234, 0xe7c35a91);
+    puts("ok 2 - writes pack low bytes; zero means submit-only, NOT ACK");
+}
+static void invalid(void)
+{
+    u8 out[4] = {0xa6,0xa6,0xa6,0xa6};
+    const size_t lengths[] = {0,5};
+    const u8 bad_read[] = {0x00,0x1f,0x30,0x37,0x40,0x5f,0x80,0xff};
+    const u8 bad_write[] = {0x10,0x1f,0x20,0x2f,0x38,0x3f,0x60,0x7f};
+    reset();
+    for (size_t i=0; i<ARRAY_SIZE(lengths); i++) {
+        assert(mt6985_pmif_read_cmd(&controller,0x60,0,0,out,lengths[i]) == -EINVAL);
+        assert(mt6985_pmif_write_cmd(&controller,0x40,0,0,payload,lengths[i]) == -EINVAL);
+    }
+    assert(mt6985_pmif_read_cmd(&controller,0x60,16,0,out,1) == -EINVAL);
+    assert(mt6985_pmif_write_cmd(&controller,0x40,16,0,payload,1) == -EINVAL);
+    assert(mt6985_pmif_read_cmd(&controller,0x60,0,0,NULL,1) == -EINVAL);
+    assert(mt6985_pmif_write_cmd(&controller,0x40,0,0,NULL,1) == -EINVAL);
+    for (size_t i=0;i<ARRAY_SIZE(bad_read);i++)
+        assert(mt6985_pmif_read_cmd(&controller,bad_read[i],0,0,out,1) == -EINVAL);
+    for (size_t i=0;i<ARRAY_SIZE(bad_write);i++)
+        assert(mt6985_pmif_write_cmd(&controller,bad_write[i],0,0,payload,1) == -EINVAL);
+    for (size_t i=0;i<sizeof(out);i++) assert(out[i] == 0xa6);
+    assert(!trace_count && !device.lock.acquisitions); balanced();
+    puts("ok 3 - invalid lengths/SID/opcodes/NULL: no MMIO or output changes");
+}
+static void blocked_callbacks(void)
+{
+    u8 out = 0xa6;
+    size_t before = trace_count;
+    assert(mt6985_pmif_read_cmd(&controller,0x60,0,0,&out,1) == -EIO);
+    assert(mt6985_pmif_write_cmd(&controller,0x40,0,0,payload,1) == -EIO);
+    assert(trace_count == before && out == 0xa6); balanced();
+}
+static void gating(void)
+{
+    reset(); device.online = false; blocked_callbacks();
+    reset(); device.failed = true; blocked_callbacks();
+    puts("ok 4 - offline and failed callbacks reject with no MMIO");
+}
+static void idle_timeout(void)
+{
+    for (unsigned writing=0;writing<2;writing++) {
+        u8 out=0xa6;
+        reset(); initial_stuck=true;
+        int ret = writing ? mt6985_pmif_write_cmd(&controller,0x40,0,0,payload,1)
+                          : mt6985_pmif_read_cmd(&controller,0x60,0,0,&out,1);
+        assert(ret == -ETIMEDOUT && device.failed && out == 0xa6);
+        assert(trace_count == 1001 && status_reads == 1001 && poll_calls == 1);
+        for (size_t i=0;i<trace_count;i++) event_at(i,'R',0x08a8,2);
+        balanced(); blocked_callbacks();
+    }
+    puts("ok 5 - initial IDLE timeout poisons read/write, unlocks, blocks later MMIO");
+}
+static void reply_timeout(void)
+{
+    u8 out[3]={0xa6,0xa6,0xa6};
+    reset(); reply_stuck=true;
+    assert(mt6985_pmif_read_cmd(&controller,0x60,0xa,0x1234,out+1,1) == -ETIMEDOUT);
+    assert(device.failed && trace_count == 1003 && poll_calls == 2 && status_reads == 1002);
+    event_at(0,'R',0x08a8,0); event_at(1,'W',0x0880,0x4a001234);
+    for (size_t i=2;i<trace_count;i++) event_at(i,'R',0x08a8,2);
+    assert(out[0]==0xa6 && out[1]==0xa6 && out[2]==0xa6);
+    balanced(); blocked_callbacks();
+    puts("ok 6 - WFVLDCLR timeout poisons, leaves output intact, no clear/retry");
+}
+static void nondata(void)
+{
+    reset();
+    for (unsigned sid=0;sid<16;sid++)
+        for (unsigned opc=0x10;opc<=0x13;opc++)
+            assert(mt6985_pmif_cmd(&controller,opc,sid) == -EOPNOTSUPP);
+    assert(mt6985_pmif_cmd(&controller,0x0f,0) == -EINVAL);
+    assert(mt6985_pmif_cmd(&controller,0x14,0) == -EINVAL);
+    assert(mt6985_pmif_cmd(&controller,0x10,16) == -EINVAL);
+    assert(!trace_count && !device.lock.acquisitions); balanced();
+    puts("ok 7 - nondata range unsupported without MMIO");
+}
+static void submitted_next_transfer(void)
+{
+    reset();
+    assert(mt6985_pmif_write_cmd(&controller,0x40,0xa,0x1234,payload,1) == 0);
+    assert(trace_count == 3 && fsm == 1);
+    /* No hardware completion is supplied: the next callback must wait, timeout,
+     * and must not overwrite WDATA/ACC while the previous command is busy. */
+    assert(mt6985_pmif_write_cmd(&controller,0x40,0xa,0x1234,payload,1) == -ETIMEDOUT);
+    assert(trace_count == 1004 && device.failed);
+    for (size_t i=3;i<trace_count;i++) event_at(i,'R',0x08a8,2);
+    balanced(); blocked_callbacks();
+    puts("ok 8 - next transfer waits for IDLE before any new submission");
+}
+int main(void)
+{
+    reads(); writes(); invalid(); gating(); idle_timeout(); reply_timeout(); nondata();
+    submitted_next_transfer(); puts("PASS: 8 PMIF userspace model groups (not hardware validation)");
+    return 0;
+}
